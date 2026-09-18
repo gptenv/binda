@@ -17,4 +17,7 @@ path = "src/main.rs"
 binda-core = { path = "../binda-core", version = "0.1.0" }
 tokio.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
 ed25519-dalek.workspace = true
+serde.workspace = true

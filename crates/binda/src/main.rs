@@ -1,36 +1,39 @@
 //! `binda`: the BINDA node daemon binary.
 //!
-//! Runs a node's gossip and resolver UDP listeners. Usage:
+//! Runs a node's gossip, resolver, client-API, and (optional) legacy DNS
+//! UDP listeners. Usage:
 //!
 //! ```text
-//! binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 [--peer 203.0.113.5:9530 ...]
+//! binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 --api 0.0.0.0:9532 \
+//!       [--dns 0.0.0.0:9533] [--peer 203.0.113.5:9530 ...]
 //! ```
 //!
 //! Every `--peer` is a remote node's gossip address; the peer list grows
 //! at runtime too, as this node learns of new peers from gossip it
-//! receives.
+//! receives. `--dns` is optional: omit it to skip the legacy RFC1035
+//! listener (real deployments would bind it to port 53, which needs
+//! elevated privilege on most systems).
 
 mod node;
 mod peers;
 
 use std::net::SocketAddr;
 
-use binda_core::client::ClientIdentity;
-use binda_core::domain::DomainName;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
 use node::Node;
 
 struct Args {
     gossip_addr: SocketAddr,
     resolver_addr: SocketAddr,
+    api_addr: SocketAddr,
+    dns_addr: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
 }
 
 fn parse_args() -> Args {
     let mut gossip_addr: SocketAddr = "0.0.0.0:9530".parse().unwrap();
     let mut resolver_addr: SocketAddr = "0.0.0.0:9531".parse().unwrap();
+    let mut api_addr: SocketAddr = "0.0.0.0:9532".parse().unwrap();
+    let mut dns_addr: Option<SocketAddr> = None;
     let mut peers = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -50,6 +53,21 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("invalid --resolver address");
             }
+            "--api" => {
+                api_addr = args
+                    .next()
+                    .expect("--api requires an address")
+                    .parse()
+                    .expect("invalid --api address");
+            }
+            "--dns" => {
+                dns_addr = Some(
+                    args.next()
+                        .expect("--dns requires an address")
+                        .parse()
+                        .expect("invalid --dns address"),
+                );
+            }
             "--peer" => {
                 let addr = args
                     .next()
@@ -67,6 +85,8 @@ fn parse_args() -> Args {
     Args {
         gossip_addr,
         resolver_addr,
+        api_addr,
+        dns_addr,
         peers,
     }
 }
@@ -78,23 +98,6 @@ async fn main() -> std::io::Result<()> {
 
     let node = Node::new(args.peers);
     println!("binda: known peers at startup: {:?}", node.peers.snapshot().await);
-
-    // Demonstrate the registration flow locally so a freshly-started node
-    // has something to gossip and resolve immediately.
-    {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let client = ClientIdentity::new(signing_key.verifying_key(), "localhost.");
-        let domain = DomainName::new("example.binda").expect("valid domain name");
-        let mut store = node.store.lock().await;
-        store.probe(&client, node.time.as_ref());
-        match store.register(domain.clone(), &client, node.time.as_ref()) {
-            Ok(token) => println!(
-                "registered {domain} for client {} at t={}",
-                client.rdns, token.issued_at_millis
-            ),
-            Err(err) => eprintln!("local registration failed: {err}"),
-        }
-    }
 
     let gossip_node = node.clone();
     let gossip_task = tokio::spawn(async move {
@@ -110,6 +113,26 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    let _ = tokio::join!(gossip_task, resolver_task);
+    let api_node = node.clone();
+    let api_task = tokio::spawn(async move {
+        if let Err(err) = api_node.run_client_api(args.api_addr).await {
+            eprintln!("client API loop exited: {err}");
+        }
+    });
+
+    let dns_task = args.dns_addr.map(|dns_addr| {
+        let dns_node = node.clone();
+        tokio::spawn(async move {
+            if let Err(err) = dns_node.run_dns(dns_addr).await {
+                eprintln!("DNS loop exited: {err}");
+            }
+        })
+    });
+
+    if let Some(dns_task) = dns_task {
+        let _ = tokio::join!(gossip_task, resolver_task, api_task, dns_task);
+    } else {
+        let _ = tokio::join!(gossip_task, resolver_task, api_task);
+    }
     Ok(())
 }

@@ -47,28 +47,58 @@ cargo doc --workspace --no-deps --open
 ## Running a node
 
 ```bash
-binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 [--peer <host:port> ...]
+binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 --api 0.0.0.0:9532 \
+      [--dns 0.0.0.0:9533] [--peer <host:port> ...]
 ```
 
 - `--gossip` — UDP address to listen on for anti-entropy gossip with peers.
-- `--resolver` — UDP address to listen on for `ResolveQuery`/`ResolveAnswer`
-  lookups (a simplified, non-RFC1035 protocol; real DNS wire compatibility
-  is future work).
+- `--resolver` — UDP address to listen on for BINDA's own
+  `ResolveQuery`/`ResolveAnswer` lookups.
+- `--api` — UDP address to listen on for the client-facing registration
+  API: signed `Probe` / `Register` / `SetRecords` requests (see
+  [`client_api`](crates/binda-core/src/client_api.rs)).
+- `--dns` — optional UDP address to also speak real RFC 1035 DNS wire
+  format on, so legacy resolvers can query BINDA directly (omit to skip
+  it; a production deployment would bind this to port 53).
 - `--peer` — a known peer's gossip address; repeatable. Peers also learn
   about each other dynamically from inbound gossip, so only one bootstrap
   peer per new node is typically needed.
 
-On startup a node self-registers a demo domain (`example.binda`) so a
-freshly booted pair of nodes has something to gossip and resolve
-immediately; that stand-in will be replaced by a real client-facing
-registration API.
+A node's clock is disciplined against public NTP servers
+([`ntp::NtpTimeSource`](crates/binda-core/src/ntp.rs)) rather than trusting
+the raw local clock, since the whole liveness model depends on every node
+agreeing on roughly the same time.
+
+See [`examples/client_demo.rs`](crates/binda/examples/client_demo.rs) for
+a full walkthrough of a client: probe liveness, register a domain,
+publish an A record, then resolve it both via BINDA's own protocol and
+via a real DNS query.
+
+```bash
+cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 &
+cargo run -p binda --example client_demo
+```
 
 ## Status
 
-Early scaffold. Core registration, liveness, collision, gossip, and
-zone-file types are implemented and unit-tested. Networking is now wired
-up: nodes gossip via UDP anti-entropy digests and answer resolver queries
-over a separate UDP socket. Still missing: a client-facing registration
-API (registration is currently only exercised via the demo code in
-`main.rs`), NTP-verified liveness (the daemon currently trusts the local
-system clock), and real RFC1035 DNS wire compatibility.
+Core registration, liveness, collision, gossip, zone-file, client API,
+NTP time, and RFC1035/punycode wire-compatibility types are implemented
+and unit-tested, and networking is wired up end-to-end: nodes gossip via
+UDP anti-entropy digests, and clients can probe/register/publish records
+over the client API and resolve via either BINDA's own protocol or real
+DNS wire format.
+
+Still missing/simplified, in rough priority order:
+
+- The DNS codec supports A/AAAA/CNAME/MX/TXT/NS over a single question,
+  no compression on the way in, no EDNS0, no zone transfers.
+- Gossip's "is this rumor newer" check compares timestamps only; it
+  doesn't yet re-run collision resolution for rumors with an *equal or
+  older* timestamp than a differing local claim, so some collisions only
+  resolve one node at a time as digests keep exchanging.
+- No persistence: every node's registry is purely in-memory and starts
+  empty on restart, by design ("temporary... in-memory datastore"), but
+  there's no snapshot/replay to speed up rejoining a network either.
+- No rate limiting or proof-of-work on the client API or DNS listeners
+  beyond the per-client registration cap; a network-facing deployment
+  would want to add some before being exposed to the open internet.

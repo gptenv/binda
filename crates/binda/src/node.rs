@@ -5,8 +5,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use binda_core::api::handle_client_request;
+use binda_core::client_api::ClientRequest;
+use binda_core::dns;
 use binda_core::gossip::{is_well_formed, DigestEntry, GossipMessage, RegistrationRumor};
-use binda_core::liveness::{SystemTimeSource, TimeSource};
+use binda_core::liveness::TimeSource;
+use binda_core::ntp::NtpTimeSource;
 use binda_core::resolver::{ResolveAnswer, ResolveQuery};
 use binda_core::store::RegistryStore;
 use binda_core::wire;
@@ -28,11 +32,16 @@ pub struct Node {
 }
 
 impl Node {
+    /// Construct a node whose clock is disciplined against public NTP
+    /// servers. This blocks briefly (bounded by the per-server query
+    /// timeout) to get an initial offset before the node starts trusting
+    /// it for liveness decisions.
     pub fn new(peers: Vec<SocketAddr>) -> Self {
+        let time: Arc<dyn TimeSource> = Arc::new(NtpTimeSource::spawn_default());
         Self {
             store: Arc::new(Mutex::new(RegistryStore::new())),
             peers: Arc::new(PeerBook::new(peers)),
-            time: Arc::new(SystemTimeSource),
+            time,
         }
     }
 
@@ -175,6 +184,59 @@ impl Node {
             if let Ok(bytes) = wire::encode(&answer) {
                 let _ = socket.send_to(&bytes, from).await;
             }
+        }
+    }
+
+    /// Bind the client-facing registration API UDP socket and serve
+    /// [`ClientRequest`]s (probe / register / set-records) until the
+    /// process exits.
+    pub async fn run_client_api(&self, bind_addr: SocketAddr) -> std::io::Result<()> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        println!("binda: client API listening on {bind_addr}");
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        loop {
+            let (len, from) = socket.recv_from(&mut buf).await?;
+            let Ok(request) = wire::decode::<ClientRequest>(&buf[..len]) else {
+                continue;
+            };
+            let response = {
+                let mut store = self.store.lock().await;
+                handle_client_request(&mut store, self.time.as_ref(), request)
+            };
+            if let Ok(bytes) = wire::encode(&response) {
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        }
+    }
+
+    /// Bind a UDP socket speaking RFC 1035 DNS wire format, so legacy DNS
+    /// clients and resolvers can query this node directly (e.g. on the
+    /// classic port 53, if run with sufficient privilege).
+    pub async fn run_dns(&self, bind_addr: SocketAddr) -> std::io::Result<()> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        println!("binda: DNS (RFC1035) listening on {bind_addr}");
+        let mut buf = vec![0u8; 512];
+        loop {
+            let (len, from) = socket.recv_from(&mut buf).await?;
+            let Ok(query) = dns::parse_query(&buf[..len]) else {
+                continue;
+            };
+            let response = {
+                let store = self.store.lock().await;
+                match store.lookup(&query.domain) {
+                    Some(reg) => {
+                        let matching: Vec<_> = reg
+                            .records
+                            .iter()
+                            .filter(|r| dns::record_matches_qtype(r, query.qtype))
+                            .cloned()
+                            .collect();
+                        dns::build_response(&query, true, &matching)
+                    }
+                    None => dns::build_response(&query, false, &[]),
+                }
+            };
+            let _ = socket.send_to(&response, from).await;
         }
     }
 }

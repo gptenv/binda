@@ -29,12 +29,24 @@
 //! - [`resolver`] — the query/answer types a client uses to resolve a name.
 //! - [`wire`] — JSON wire encoding shared by every message type above,
 //!   used by the `binda` binary's network transport.
+//! - [`client_api`] — signed, replay-resistant requests an end-user client
+//!   sends to probe liveness, register a domain, or publish records.
+//! - [`api`] — glue applying an authenticated [`client_api::ClientRequest`]
+//!   to a [`store::RegistryStore`].
+//! - [`ntp`] — an NTP-disciplined [`liveness::TimeSource`].
+//! - [`punycode`] / [`dns`] — RFC 3492 and RFC 1035 wire compatibility, so
+//!   legacy DNS clients can resolve BINDA's Unicode-native names.
 
+pub mod api;
 pub mod client;
+pub mod client_api;
 pub mod collision;
+pub mod dns;
 pub mod domain;
 pub mod gossip;
 pub mod liveness;
+pub mod ntp;
+pub mod punycode;
 pub mod resolver;
 pub mod store;
 pub mod token;
