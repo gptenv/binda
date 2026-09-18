@@ -216,11 +216,25 @@ impl Node {
     pub async fn run_dns(&self, bind_addr: SocketAddr) -> std::io::Result<()> {
         let socket = UdpSocket::bind(bind_addr).await?;
         println!("binda: native name-lookup protocol listening on {bind_addr}");
-        let mut buf = vec![0u8; 512];
+        // Sized to match the other listeners' datagram cap, not DNS's
+        // traditional 512-byte assumption: a name here has no length
+        // limit, so the buffer shouldn't impose one either.
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
-            let Ok(query) = dns::parse_query(&buf[..len]) else {
-                continue;
+            let query = match dns::parse_query(&buf[..len]) {
+                Ok(query) => query,
+                Err(_) => {
+                    // Echo back a minimal error response when we can at
+                    // least recover the message ID, so a malformed
+                    // request gets an answer instead of silence.
+                    if len >= 2 {
+                        let id = u16::from_be_bytes([buf[0], buf[1]]);
+                        let response = dns::build_error_response(id, dns::RCODE_FORMAT_ERROR);
+                        let _ = socket.send_to(&response, from).await;
+                    }
+                    continue;
+                }
             };
             let response = {
                 let store = self.store.lock().await;

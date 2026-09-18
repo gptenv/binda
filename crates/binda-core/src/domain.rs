@@ -5,7 +5,14 @@
 //! right-to-left scripts intermixed with left-to-right ones are all valid,
 //! as long as every scalar value is *printable* (i.e. not a control
 //! character and not an unassigned/format code point that would render
-//! invisibly or corrupt terminal state).
+//! invisibly or corrupt terminal state). There is no length limit: unlike
+//! classic DNS's 255-octet name cap, a BINDA name may be arbitrarily long
+//! (a heavily-stacked zalgo label, for instance, is not truncated or
+//! rejected for its length). The only practical ceilings are the ones any
+//! finite computer already has — available memory, and the transport
+//! layer's own datagram size limit (see [`crate::wire::MAX_DATAGRAM_BYTES`]
+//! and [`crate::dns`]'s label length field) — neither of which is a rule
+//! about what a valid *name* is.
 
 use std::fmt;
 use thiserror::Error;
@@ -21,20 +28,11 @@ pub struct DomainName(String);
 pub enum DomainNameError {
     #[error("domain name must not be empty")]
     Empty,
-    #[error("domain name exceeds the maximum length of {max} scalar values")]
-    TooLong { max: usize },
     #[error("domain name contains a non-printable character at byte offset {offset}")]
     NonPrintableChar { offset: usize },
     #[error("domain label must not be empty (found consecutive or leading/trailing '.')")]
     EmptyLabel,
 }
-
-/// Maximum length of a domain name, measured in Unicode scalar values.
-///
-/// Classic DNS caps names at 255 octets; since BINDA names can contain
-/// multi-byte scalars (including 4-byte emoji), the cap here is expressed
-/// in scalar values instead, matching the spirit of the original limit.
-pub const MAX_DOMAIN_SCALARS: usize = 255;
 
 impl DomainName {
     /// Validate and construct a new [`DomainName`].
@@ -47,13 +45,6 @@ impl DomainName {
         let raw = raw.into();
         if raw.is_empty() {
             return Err(DomainNameError::Empty);
-        }
-
-        let scalar_count = raw.chars().count();
-        if scalar_count > MAX_DOMAIN_SCALARS {
-            return Err(DomainNameError::TooLong {
-                max: MAX_DOMAIN_SCALARS,
-            });
         }
 
         for (offset, ch) in raw.char_indices() {
@@ -111,17 +102,24 @@ mod tests {
     }
 
     #[test]
-    fn accepts_heavy_zalgo_stacking_within_the_scalar_budget() {
+    fn accepts_heavy_zalgo_stacking_with_no_length_cap() {
         // Real zalgo text piles many combining marks onto a single base
-        // character. Stack 40 of them onto one 'e' and confirm it's still
-        // a single accepted label, not rejected as malformed.
+        // character, easily thousands of scalar values for a short
+        // visual label. There is no length limit, so this must succeed
+        // however many marks are stacked on.
         let combining_marks = ['\u{0301}', '\u{0316}', '\u{0327}', '\u{0353}'];
         let mut label = String::from("e");
-        for i in 0..40 {
+        for i in 0..5_000 {
             label.push(combining_marks[i % combining_marks.len()]);
         }
         let domain = DomainName::new(label.clone()).expect("heavy zalgo label should be valid");
         assert_eq!(domain.as_str(), label.as_str());
+    }
+
+    #[test]
+    fn accepts_arbitrarily_long_names() {
+        let long_name = "a".repeat(100_000);
+        assert!(DomainName::new(long_name).is_ok());
     }
 
     #[test]

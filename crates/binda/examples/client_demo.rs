@@ -123,15 +123,15 @@ fn main() {
     native_query.extend([0u8; 6]);
     for label in domain.labels() {
         let bytes = label.as_bytes();
-        native_query.push(bytes.len() as u8);
+        native_query.extend((bytes.len() as u32).to_be_bytes());
         native_query.extend(bytes);
     }
-    native_query.push(0);
+    native_query.extend(0u32.to_be_bytes());
     native_query.extend(1u16.to_be_bytes()); // QTYPE A
     native_query.extend(1u16.to_be_bytes()); // QCLASS IN
 
     socket.send_to(&native_query, dns_addr).expect("send native query");
-    let mut buf = [0u8; 512];
+    let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
     let (len, _) = socket.recv_from(&mut buf).expect("recv native response");
     let response = &buf[..len];
     let ancount = u16::from_be_bytes([response[6], response[7]]);

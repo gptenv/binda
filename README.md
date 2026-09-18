@@ -11,9 +11,13 @@ within a 3-second window.
 - **Squatting resistance** — a maximum of 5 live registrations per client,
   where a client is identified by an Ed25519 signature combined with its
   reverse-DNS hostname.
-- **Full Unicode names** — domain labels may use any printable Unicode
-  scalar value: emoji, combining-mark ("zalgo") sequences, and mixed
-  right-to-left/left-to-right scripts are all valid.
+- **Full Unicode names, no length limit** — domain labels may use any
+  printable Unicode scalar value: emoji, combining-mark ("zalgo")
+  sequences, and mixed right-to-left/left-to-right scripts (intermixed
+  within a single label, not just adjacent) are all valid. Unlike classic
+  DNS's 255-octet/63-byte-label ceiling, there is no length cap at all —
+  a name is only as long as available memory and the transport's own
+  datagram size allow.
 - **Mutual collision arbitration** — when two nodes learn of simultaneous
   claims on the same name, neither unilaterally decides the tie-break rule;
   they each randomly propose "higher wins" or "lower wins" every round

@@ -14,9 +14,20 @@
 //! translating gateway (if one is ever built) is a separate, optional
 //! component layered on top, not part of this wire format.
 //!
-//! Scope: single-question queries, no message compression on the way in
-//! (real clients don't compress the question section), and compressed
-//! answer names pointing back at the question (the common case). EDNS0,
+//! Unlike classic DNS, a label here is **not** capped at 63 bytes and a
+//! full name is **not** capped at 255 bytes: each label is prefixed by a
+//! 4-byte big-endian length rather than DNS's single length byte (whose
+//! top two bits are reserved for compression pointers), so there is no
+//! structural ceiling on how long a name — however extravagantly a zalgo
+//! label stacks combining marks — can be. Answer names are always
+//! re-encoded in full rather than using a DNS-style compression pointer
+//! back to the question, since that trick only existed to save bytes
+//! within a scheme this protocol has already abandoned. The only limits
+//! left are the ones nothing gets around: available memory, and the
+//! transport's own datagram size cap (see
+//! [`crate::wire::MAX_DATAGRAM_BYTES`]).
+//!
+//! Scope: single-question queries, no message compression. EDNS0,
 //! multi-question messages, and zone transfer opcodes are not supported.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -88,8 +99,17 @@ fn read_u16(bytes: &[u8], pos: usize) -> Result<u16, DnsError> {
     Ok(u16::from_be_bytes(slice))
 }
 
+fn read_u32(bytes: &[u8], pos: usize) -> Result<u32, DnsError> {
+    let slice: [u8; 4] = bytes
+        .get(pos..pos + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(DnsError::MalformedLabel)?;
+    Ok(u32::from_be_bytes(slice))
+}
+
 /// Parse the question section out of a raw incoming message. Each label is
-/// a length byte followed by that many raw UTF-8 bytes — never Punycode.
+/// a 4-byte length followed by that many raw UTF-8 bytes — never Punycode,
+/// and never capped at DNS's 63-byte label limit.
 pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     if bytes.len() < 12 {
         return Err(DnsError::TooShort);
@@ -103,16 +123,11 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     let mut pos = 12;
     let mut labels = Vec::new();
     loop {
-        let len = *bytes.get(pos).ok_or(DnsError::MalformedLabel)? as usize;
+        let len = read_u32(bytes, pos)? as usize;
+        pos += 4;
         if len == 0 {
-            pos += 1;
             break;
         }
-        if len & 0xC0 != 0 {
-            // Compression pointers aren't valid in a question we parse.
-            return Err(DnsError::MalformedLabel);
-        }
-        pos += 1;
         let label_bytes = bytes.get(pos..pos + len).ok_or(DnsError::MalformedLabel)?;
         let label = std::str::from_utf8(label_bytes).map_err(|_| DnsError::InvalidUtf8)?;
         labels.push(label.to_string());
@@ -127,17 +142,13 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     Ok(DnsQuery { id, domain, qtype, qclass })
 }
 
-fn encode_domain_labels(domain: &DomainName, out: &mut Vec<u8>) -> Result<(), DnsError> {
+fn encode_domain_labels(domain: &DomainName, out: &mut Vec<u8>) {
     for label in domain.labels() {
         let bytes = label.as_bytes();
-        if bytes.len() > 63 {
-            return Err(DnsError::MalformedLabel);
-        }
-        out.push(bytes.len() as u8);
+        out.extend((bytes.len() as u32).to_be_bytes());
         out.extend(bytes);
     }
-    out.push(0);
-    Ok(())
+    out.extend(0u32.to_be_bytes());
 }
 
 fn encode_rdata(record: &Record) -> Result<Vec<u8>, DnsError> {
@@ -153,7 +164,7 @@ fn encode_rdata(record: &Record) -> Result<Vec<u8>, DnsError> {
         RecordType::Cname | RecordType::Ns => {
             let target = DomainName::new(record.value.clone())?;
             let mut buf = Vec::new();
-            encode_domain_labels(&target, &mut buf)?;
+            encode_domain_labels(&target, &mut buf);
             Ok(buf)
         }
         RecordType::Mx => {
@@ -164,7 +175,7 @@ fn encode_rdata(record: &Record) -> Result<Vec<u8>, DnsError> {
                 .unwrap_or((0, record.value.as_str()));
             let target = DomainName::new(exchange)?;
             let mut buf = preference.to_be_bytes().to_vec();
-            encode_domain_labels(&target, &mut buf)?;
+            encode_domain_labels(&target, &mut buf);
             Ok(buf)
         }
         RecordType::Txt => {
@@ -200,22 +211,25 @@ pub fn build_response(query: &DnsQuery, domain_exists: bool, matching: &[Record]
     out.extend(0u16.to_be_bytes()); // ARCOUNT
 
     // Echo the question section verbatim.
-    if encode_domain_labels(&query.domain, &mut out).is_err() {
-        // A domain that round-tripped through parse_query should always
-        // re-encode; if it somehow can't, fail closed with FORMERR.
-        return format_error_response(query.id);
-    }
+    encode_domain_labels(&query.domain, &mut out);
     out.extend(query.qtype.to_be_bytes());
     out.extend(query.qclass.to_be_bytes());
 
     for record in matching {
-        out.extend([0xC0, 0x0C]); // pointer back to the question name
+        // Always re-encode the name in full, rather than a DNS-style
+        // compression pointer back to the question — that trick only
+        // ever existed to save bytes within a length scheme this
+        // protocol doesn't use.
+        encode_domain_labels(&query.domain, &mut out);
         out.extend(record_type_code(record.record_type).to_be_bytes());
         out.extend(CLASS_IN.to_be_bytes());
         out.extend(record.ttl_secs.to_be_bytes());
         match encode_rdata(record) {
             Ok(rdata) => {
-                out.extend((rdata.len() as u16).to_be_bytes());
+                // A 4-byte RDLENGTH, not DNS's 2-byte one, so an
+                // arbitrarily long CNAME/NS/MX target name never
+                // silently truncates.
+                out.extend((rdata.len() as u32).to_be_bytes());
                 out.extend(rdata);
             }
             Err(_) => continue,
@@ -225,13 +239,20 @@ pub fn build_response(query: &DnsQuery, domain_exists: bool, matching: &[Record]
     out
 }
 
-fn format_error_response(id: u16) -> Vec<u8> {
+/// Build a minimal error response (e.g. FORMERR) for a message this node
+/// couldn't parse into a [`DnsQuery`] at all, so the sender gets a
+/// response instead of silence. `id` should be read directly from the
+/// first two bytes of the offending message when possible.
+pub fn build_error_response(id: u16, rcode: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(12);
     out.extend(id.to_be_bytes());
-    out.extend((0x8000u16 | RCODE_FORMERR).to_be_bytes());
+    out.extend((0x8000u16 | rcode).to_be_bytes());
     out.extend([0u8; 8]);
     out
 }
+
+/// RCODE 1, "Format Error": the request itself was malformed.
+pub const RCODE_FORMAT_ERROR: u16 = RCODE_FORMERR;
 
 /// Whether `record` should be included in the answer to a query with the
 /// given QTYPE.
@@ -251,10 +272,10 @@ mod tests {
         buf.extend([0u8; 6]); // AN/NS/AR counts
         for label in name.split('.') {
             let bytes = label.as_bytes();
-            buf.push(bytes.len() as u8);
+            buf.extend((bytes.len() as u32).to_be_bytes());
             buf.extend(bytes);
         }
-        buf.push(0);
+        buf.extend(0u32.to_be_bytes());
         buf.extend(qtype.to_be_bytes());
         buf.extend(CLASS_IN.to_be_bytes());
         buf
@@ -311,10 +332,26 @@ mod tests {
         let response = build_response(&query, false, &[]);
         assert!(!response.windows(4).any(|w| w == b"xn--"));
         // The question section (after the 12-byte header) should contain
-        // the raw "🔥" UTF-8 bytes length-prefixed.
+        // the raw "🔥" UTF-8 bytes, prefixed by a 4-byte length.
         let fire = "🔥".as_bytes();
-        assert_eq!(response[12] as usize, fire.len());
-        assert_eq!(&response[13..13 + fire.len()], fire);
+        let len_field = u32::from_be_bytes(response[12..16].try_into().unwrap());
+        assert_eq!(len_field as usize, fire.len());
+        assert_eq!(&response[16..16 + fire.len()], fire);
+    }
+
+    #[test]
+    fn accepts_a_label_far_longer_than_dns_would_allow() {
+        // Classic DNS caps a label at 63 bytes and a name at 255. Build
+        // one label alone well past both to prove there's no such cap
+        // here.
+        let long_label = "a".repeat(10_000);
+        let bytes = build_query_bytes(9, &format!("{long_label}.binda"), TYPE_A);
+        let query = parse_query(&bytes).unwrap();
+        assert_eq!(query.domain.labels().next().unwrap().len(), 10_000);
+
+        let response = build_response(&query, false, &[]);
+        let reparsed = parse_query(&response).unwrap();
+        assert_eq!(reparsed.domain.labels().next().unwrap().len(), 10_000);
     }
 
     #[test]
