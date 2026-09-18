@@ -10,12 +10,14 @@ use crate::collision::negotiate_locally;
 use crate::domain::DomainName;
 use crate::liveness::{LivenessTracker, TimeSource};
 use crate::token::RegistrationToken;
+use crate::zone::Record;
 
 /// A single domain's current registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub client_key: String,
     pub token: RegistrationToken,
+    pub records: Vec<Record>,
 }
 
 /// Reasons a registration attempt can be refused.
@@ -87,6 +89,7 @@ impl RegistryStore {
             Registration {
                 client_key: client.key(),
                 token,
+                records: Vec::new(),
             },
         );
         self.liveness.increment_registration(client);
@@ -105,7 +108,65 @@ impl RegistryStore {
     ) {
         let winner_token = negotiate_locally(a.1, b.1);
         let (client_key, token) = if winner_token == a.1 { a } else { b };
-        self.registrations.insert(domain, Registration { client_key, token });
+        self.registrations.insert(
+            domain,
+            Registration {
+                client_key,
+                token,
+                records: Vec::new(),
+            },
+        );
+    }
+
+    /// Attach zone records to a domain this node's own client already
+    /// owns. Fails silently (no-op) if `client` does not hold `domain`.
+    pub fn set_records(&mut self, domain: &DomainName, client: &ClientIdentity, records: Vec<Record>) -> bool {
+        match self.registrations.get_mut(domain) {
+            Some(reg) if reg.client_key == client.key() => {
+                reg.records = records;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Absorb a fact learned from gossip: another node claims `domain` is
+    /// held by `client_key` as of `token`. Never subject to this node's
+    /// own liveness/cap rules — those only gate registrations *this* node
+    /// issues locally. If the domain is already held here under a
+    /// different claim, the two claims are arbitrated via the same mutual
+    /// coin-negotiation protocol used for a live collision.
+    pub fn adopt_rumor(&mut self, domain: DomainName, client_key: String, token: RegistrationToken) {
+        match self.registrations.get(&domain) {
+            None => {
+                self.registrations.insert(
+                    domain,
+                    Registration {
+                        client_key,
+                        token,
+                        records: Vec::new(),
+                    },
+                );
+            }
+            Some(existing) if existing.client_key == client_key && existing.token == token => {
+                // Already known; nothing to do.
+            }
+            Some(existing) => {
+                self.resolve_collision(
+                    domain,
+                    (existing.client_key.clone(), existing.token),
+                    (client_key, token),
+                );
+            }
+        }
+    }
+
+    /// Every `(domain, client_key, token)` this node currently holds, for
+    /// building a gossip digest.
+    pub fn all_rumors(&self) -> impl Iterator<Item = (&DomainName, &str, RegistrationToken)> {
+        self.registrations
+            .iter()
+            .map(|(domain, reg)| (domain, reg.client_key.as_str(), reg.token))
     }
 
     /// Release every registration belonging to clients who have missed

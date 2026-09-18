@@ -29,8 +29,10 @@ within a 3-second window.
 
 - [`crates/binda-core`](crates/binda-core) — the library crate: domain
   names, client identity, liveness/registration rules, the gossip message
-  types, collision resolution, and the zone file format.
-- [`crates/binda`](crates/binda) — the `binda` binary crate.
+  types, collision resolution, the zone file format, the resolver
+  query/answer types, and the JSON wire encoding shared by all of them.
+- [`crates/binda`](crates/binda) — the `binda` binary crate: a UDP gossip
+  daemon plus a UDP resolver query daemon built on top of `binda-core`.
 
 ## Building
 
@@ -42,9 +44,31 @@ cargo test --workspace
 cargo doc --workspace --no-deps --open
 ```
 
+## Running a node
+
+```bash
+binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 [--peer <host:port> ...]
+```
+
+- `--gossip` — UDP address to listen on for anti-entropy gossip with peers.
+- `--resolver` — UDP address to listen on for `ResolveQuery`/`ResolveAnswer`
+  lookups (a simplified, non-RFC1035 protocol; real DNS wire compatibility
+  is future work).
+- `--peer` — a known peer's gossip address; repeatable. Peers also learn
+  about each other dynamically from inbound gossip, so only one bootstrap
+  peer per new node is typically needed.
+
+On startup a node self-registers a demo domain (`example.binda`) so a
+freshly booted pair of nodes has something to gossip and resolve
+immediately; that stand-in will be replaced by a real client-facing
+registration API.
+
 ## Status
 
-Early scaffold. The core registration, liveness, collision, gossip, and
-zone-file types are implemented and unit-tested; the network transport
-(actual gossip wire protocol and resolver query handling) is not yet
-wired up.
+Early scaffold. Core registration, liveness, collision, gossip, and
+zone-file types are implemented and unit-tested. Networking is now wired
+up: nodes gossip via UDP anti-entropy digests and answer resolver queries
+over a separate UDP socket. Still missing: a client-facing registration
+API (registration is currently only exercised via the demo code in
+`main.rs`), NTP-verified liveness (the daemon currently trusts the local
+system clock), and real RFC1035 DNS wire compatibility.

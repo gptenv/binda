@@ -26,14 +26,19 @@
 //! - [`store`] — the in-memory registration table that ties the above
 //!   together.
 //! - [`zone`] — BIND9-equivalent zone data, serialized as TOML.
+//! - [`resolver`] — the query/answer types a client uses to resolve a name.
+//! - [`wire`] — JSON wire encoding shared by every message type above,
+//!   used by the `binda` binary's network transport.
 
 pub mod client;
 pub mod collision;
 pub mod domain;
 pub mod gossip;
 pub mod liveness;
+pub mod resolver;
 pub mod store;
 pub mod token;
+pub mod wire;
 pub mod zone;
 
 pub use client::ClientIdentity;
