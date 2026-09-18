@@ -287,6 +287,20 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_intermixed_bidi_and_zalgo_label_on_the_wire() {
+        // Arabic and Latin interleaved in one label, plus stacked
+        // combining marks (zalgo), all as raw UTF-8 bytes end to end.
+        let label = "helloمرحباe\u{0301}\u{0316}\u{0327}🔥world";
+        let bytes = build_query_bytes(3, label, TYPE_A);
+        let query = parse_query(&bytes).unwrap();
+        assert_eq!(query.domain.as_str(), label);
+
+        let response = build_response(&query, false, &[]);
+        let reparsed = parse_query(&response).expect("response's echoed question should re-parse");
+        assert_eq!(reparsed.domain.as_str(), label);
+    }
+
+    #[test]
     fn response_echoes_unicode_labels_as_raw_utf8() {
         let query = DnsQuery {
             id: 5,

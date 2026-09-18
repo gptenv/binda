@@ -111,6 +111,30 @@ mod tests {
     }
 
     #[test]
+    fn accepts_heavy_zalgo_stacking_within_the_scalar_budget() {
+        // Real zalgo text piles many combining marks onto a single base
+        // character. Stack 40 of them onto one 'e' and confirm it's still
+        // a single accepted label, not rejected as malformed.
+        let combining_marks = ['\u{0301}', '\u{0316}', '\u{0327}', '\u{0353}'];
+        let mut label = String::from("e");
+        for i in 0..40 {
+            label.push(combining_marks[i % combining_marks.len()]);
+        }
+        let domain = DomainName::new(label.clone()).expect("heavy zalgo label should be valid");
+        assert_eq!(domain.as_str(), label.as_str());
+    }
+
+    #[test]
+    fn accepts_rtl_and_ltr_intermixed_within_one_label() {
+        // Not just an RTL label next to an LTR one (already covered above)
+        // but Arabic and Latin characters interleaved within a *single*
+        // label, exactly as the "intermixed" requirement calls for.
+        let domain = DomainName::new("helloمرحبا🔥world").expect("intermixed bidi label should be valid");
+        assert_eq!(domain.labels().count(), 1);
+        assert_eq!(domain.as_str(), "helloمرحبا🔥world");
+    }
+
+    #[test]
     fn rejects_empty() {
         assert_eq!(DomainName::new(""), Err(DomainNameError::Empty));
     }
