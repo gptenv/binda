@@ -1,7 +1,7 @@
 //! `binda`: the BINDA node daemon binary.
 //!
-//! Runs a node's gossip, resolver, client-API, and (optional) legacy DNS
-//! UDP listeners. Usage:
+//! Runs a node's gossip, resolver, client-API, and (optional) native
+//! name-lookup UDP listeners. Usage:
 //!
 //! ```text
 //! binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 --api 0.0.0.0:9532 \
@@ -10,8 +10,10 @@
 //!
 //! Every `--peer` is a remote node's gossip address; the peer list grows
 //! at runtime too, as this node learns of new peers from gossip it
-//! receives. `--dns` is optional: omit it to skip the legacy RFC1035
-//! listener (real deployments would bind it to port 53, which needs
+//! receives. `--dns` is optional: omit it to skip the DNS-shaped listener
+//! (see [`binda_core::dns`] — it is BINDA's own native, UTF-8-native
+//! protocol, not RFC 1035; a production deployment might still bind it to
+//! port 53 as a convenient, familiar-looking address, which needs
 //! elevated privilege on most systems).
 
 mod node;

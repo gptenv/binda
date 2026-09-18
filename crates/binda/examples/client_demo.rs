@@ -1,6 +1,7 @@
-//! An example end-user client: probes liveness, registers a domain, sets
-//! an A record, then resolves it both via BINDA's own resolver protocol
-//! and via a real RFC1035 DNS query.
+//! An example end-user client: probes liveness, registers a Unicode
+//! domain, sets an A record, then resolves it both via BINDA's own
+//! resolver protocol and via BINDA's native DNS-shaped wire protocol
+//! (which carries the label as raw UTF-8 — no Punycode involved).
 //!
 //! Run a node first, then this example against it:
 //!
@@ -67,7 +68,9 @@ fn main() {
     println!("probe -> {probe_resp:?}");
 
     // 2. Register a domain.
-    let domain = DomainName::new("demo.binda").expect("valid domain");
+    // A native Unicode label, to demonstrate that it travels the wire as
+    // raw UTF-8 rather than being translated to Punycode/ASCII.
+    let domain = DomainName::new("🔥demo.binda").expect("valid domain");
     let t = now_millis();
     let msg = register_message(&domain, t);
     let sig = signing_key.sign(&msg);
@@ -109,28 +112,31 @@ fn main() {
     let answer: ResolveAnswer = send_recv(&socket, api_addr.replace("9532", "9531").as_str(), &query);
     println!("resolve (binda protocol) -> {answer:?}");
 
-    // 5. Resolve the same domain via a real RFC1035 DNS query.
-    let mut dns_query = Vec::new();
-    dns_query.extend(0x1234u16.to_be_bytes());
-    dns_query.extend(0x0100u16.to_be_bytes());
-    dns_query.extend(1u16.to_be_bytes());
-    dns_query.extend([0u8; 6]);
+    // 5. Resolve the same domain via BINDA's native, DNS-shaped wire
+    // protocol. Every label goes on the wire as raw UTF-8 — never
+    // Punycode/ASCII — which is the entire reason this is BINDA's own
+    // protocol rather than RFC 1035.
+    let mut native_query = Vec::new();
+    native_query.extend(0x1234u16.to_be_bytes());
+    native_query.extend(0x0100u16.to_be_bytes());
+    native_query.extend(1u16.to_be_bytes());
+    native_query.extend([0u8; 6]);
     for label in domain.labels() {
-        let ascii = binda_core::punycode::label_to_ascii(label).unwrap();
-        dns_query.push(ascii.len() as u8);
-        dns_query.extend(ascii.as_bytes());
+        let bytes = label.as_bytes();
+        native_query.push(bytes.len() as u8);
+        native_query.extend(bytes);
     }
-    dns_query.push(0);
-    dns_query.extend(1u16.to_be_bytes()); // QTYPE A
-    dns_query.extend(1u16.to_be_bytes()); // QCLASS IN
+    native_query.push(0);
+    native_query.extend(1u16.to_be_bytes()); // QTYPE A
+    native_query.extend(1u16.to_be_bytes()); // QCLASS IN
 
-    socket.send_to(&dns_query, dns_addr).expect("send dns query");
+    socket.send_to(&native_query, dns_addr).expect("send native query");
     let mut buf = [0u8; 512];
-    let (len, _) = socket.recv_from(&mut buf).expect("recv dns response");
+    let (len, _) = socket.recv_from(&mut buf).expect("recv native response");
     let response = &buf[..len];
     let ancount = u16::from_be_bytes([response[6], response[7]]);
-    println!("resolve (RFC1035 DNS) -> ANCOUNT={ancount}, {} bytes", response.len());
-    if let Ok(parsed) = dns::parse_query(&dns_query) {
-        println!("  echoed query domain: {}", parsed.domain);
+    println!("resolve (BINDA native protocol) -> ANCOUNT={ancount}, {} bytes", response.len());
+    if let Ok(parsed) = dns::parse_query(&native_query) {
+        println!("  echoed query domain (raw UTF-8 on the wire): {}", parsed.domain);
     }
 }

@@ -1,15 +1,21 @@
-//! A minimal RFC 1035-compatible DNS message codec, so legacy DNS clients
-//! and resolvers (which speak ASCII-label DNS wire format on UDP port 53)
-//! can query a BINDA node directly, without needing to speak BINDA's own
-//! [`crate::resolver`] protocol.
+//! BINDA's native name-lookup wire protocol.
 //!
-//! BINDA domains are natively Unicode; on the wire they're translated to
-//! and from ASCII via [`crate::punycode`] (the same "xn--" ACE form real
-//! DNS already uses for internationalized domain names), so this codec
-//! never has to invent a non-standard encoding.
+//! This reuses DNS's familiar message shape — a fixed header, a question
+//! section, an answer section built from the same handful of record types
+//! (A/AAAA/CNAME/MX/TXT/NS) — because that shape is a well-understood,
+//! efficient design, not because this protocol is trying to interoperate
+//! with RFC 1035 wire traffic. It deliberately is **not** RFC 1035
+//! compatible: every domain label is carried as its raw UTF-8 bytes,
+//! never as ASCII, and never as Punycode/IDNA ACE (`xn--...`). BINDA's
+//! reason to exist is to make Unicode names first-class instead of
+//! routing them through an ASCII-compatibility encoding, so this codec
+//! has no code path that produces or accepts one. A legacy DNS resolver
+//! cannot parse this protocol's messages, and that is intentional; a
+//! translating gateway (if one is ever built) is a separate, optional
+//! component layered on top, not part of this wire format.
 //!
 //! Scope: single-question queries, no message compression on the way in
-//! (real resolvers don't compress the question section), and compressed
+//! (real clients don't compress the question section), and compressed
 //! answer names pointing back at the question (the common case). EDNS0,
 //! multi-question messages, and zone transfer opcodes are not supported.
 
@@ -19,17 +25,18 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use crate::domain::DomainName;
-use crate::punycode;
 use crate::zone::{Record, RecordType};
 
-/// Standard DNS resource record TYPE values BINDA understands.
+/// Resource record TYPE values, reusing the standard DNS assignments
+/// purely so the numbers are already meaningful to anyone who knows DNS —
+/// this protocol does not otherwise follow RFC 1035.
 const TYPE_A: u16 = 1;
 const TYPE_NS: u16 = 2;
 const TYPE_CNAME: u16 = 5;
 const TYPE_MX: u16 = 15;
 const TYPE_TXT: u16 = 16;
 const TYPE_AAAA: u16 = 28;
-/// QTYPE meaning "any type", per RFC 1035 §3.2.3.
+/// QTYPE meaning "any type".
 const QTYPE_ANY: u16 = 255;
 
 const CLASS_IN: u16 = 1;
@@ -41,33 +48,25 @@ const RCODE_FORMERR: u16 = 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DnsError {
-    #[error("message shorter than a DNS header")]
+    #[error("message shorter than a header")]
     TooShort,
     #[error("message does not contain exactly one question")]
     UnsupportedQuestionCount,
     #[error("malformed domain name label in message")]
     MalformedLabel,
-    #[error("label failed punycode decoding: {0}")]
-    Punycode(#[from] punycode::PunycodeError),
+    #[error("label is not valid UTF-8")]
+    InvalidUtf8,
     #[error("decoded domain name is invalid: {0}")]
     InvalidDomain(#[from] crate::domain::DomainNameError),
 }
 
-/// A parsed incoming DNS query.
+/// A parsed incoming query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsQuery {
     pub id: u16,
     pub domain: DomainName,
     pub qtype: u16,
     pub qclass: u16,
-}
-
-fn read_u16(bytes: &[u8], pos: usize) -> Result<u16, DnsError> {
-    let slice: [u8; 2] = bytes
-        .get(pos..pos + 2)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(DnsError::MalformedLabel)?;
-    Ok(u16::from_be_bytes(slice))
 }
 
 fn record_type_code(record_type: RecordType) -> u16 {
@@ -81,7 +80,16 @@ fn record_type_code(record_type: RecordType) -> u16 {
     }
 }
 
-/// Parse the question section out of a raw incoming DNS message.
+fn read_u16(bytes: &[u8], pos: usize) -> Result<u16, DnsError> {
+    let slice: [u8; 2] = bytes
+        .get(pos..pos + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(DnsError::MalformedLabel)?;
+    Ok(u16::from_be_bytes(slice))
+}
+
+/// Parse the question section out of a raw incoming message. Each label is
+/// a length byte followed by that many raw UTF-8 bytes — never Punycode.
 pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     if bytes.len() < 12 {
         return Err(DnsError::TooShort);
@@ -106,8 +114,8 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
         }
         pos += 1;
         let label_bytes = bytes.get(pos..pos + len).ok_or(DnsError::MalformedLabel)?;
-        let label_ascii = std::str::from_utf8(label_bytes).map_err(|_| DnsError::MalformedLabel)?;
-        labels.push(punycode::label_from_ascii(label_ascii)?);
+        let label = std::str::from_utf8(label_bytes).map_err(|_| DnsError::InvalidUtf8)?;
+        labels.push(label.to_string());
         pos += len;
     }
 
@@ -121,12 +129,12 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
 
 fn encode_domain_labels(domain: &DomainName, out: &mut Vec<u8>) -> Result<(), DnsError> {
     for label in domain.labels() {
-        let ascii = punycode::label_to_ascii(label)?;
-        if ascii.len() > 63 {
+        let bytes = label.as_bytes();
+        if bytes.len() > 63 {
             return Err(DnsError::MalformedLabel);
         }
-        out.push(ascii.len() as u8);
-        out.extend(ascii.as_bytes());
+        out.push(bytes.len() as u8);
+        out.extend(bytes);
     }
     out.push(0);
     Ok(())
@@ -170,7 +178,7 @@ fn encode_rdata(record: &Record) -> Result<Vec<u8>, DnsError> {
     }
 }
 
-/// Build a DNS response for `query`.
+/// Build a response for `query`.
 ///
 /// - `domain_exists`: whether the queried domain has any registration at
 ///   all (drives NXDOMAIN vs. an empty NOERROR answer).
@@ -191,8 +199,7 @@ pub fn build_response(query: &DnsQuery, domain_exists: bool, matching: &[Record]
     out.extend(0u16.to_be_bytes()); // NSCOUNT
     out.extend(0u16.to_be_bytes()); // ARCOUNT
 
-    // Echo the question section verbatim (re-encoding it also normalizes
-    // punycode casing).
+    // Echo the question section verbatim.
     if encode_domain_labels(&query.domain, &mut out).is_err() {
         // A domain that round-tripped through parse_query should always
         // re-encode; if it somehow can't, fail closed with FORMERR.
@@ -243,9 +250,9 @@ mod tests {
         buf.extend(1u16.to_be_bytes()); // QDCOUNT
         buf.extend([0u8; 6]); // AN/NS/AR counts
         for label in name.split('.') {
-            let ascii = punycode::label_to_ascii(label).unwrap();
-            buf.push(ascii.len() as u8);
-            buf.extend(ascii.as_bytes());
+            let bytes = label.as_bytes();
+            buf.push(bytes.len() as u8);
+            buf.extend(bytes);
         }
         buf.push(0);
         buf.extend(qtype.to_be_bytes());
@@ -263,10 +270,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_unicode_query_via_punycode() {
+    fn parses_unicode_query_as_native_utf8_no_punycode() {
         let bytes = build_query_bytes(1, "🔥.binda", TYPE_A);
+        // The raw label bytes on the wire are the UTF-8 encoding of "🔥",
+        // never an "xn--..." Punycode/ACE form.
+        assert!(!bytes.windows(4).any(|w| w == b"xn--"));
         let query = parse_query(&bytes).unwrap();
         assert_eq!(query.domain.as_str(), "🔥.binda");
+    }
+
+    #[test]
+    fn parses_mixed_script_query() {
+        let bytes = build_query_bytes(2, "مرحبا.binda", TYPE_A);
+        let query = parse_query(&bytes).unwrap();
+        assert_eq!(query.domain.as_str(), "مرحبا.binda");
+    }
+
+    #[test]
+    fn response_echoes_unicode_labels_as_raw_utf8() {
+        let query = DnsQuery {
+            id: 5,
+            domain: DomainName::new("🔥.binda").unwrap(),
+            qtype: TYPE_A,
+            qclass: CLASS_IN,
+        };
+        let response = build_response(&query, false, &[]);
+        assert!(!response.windows(4).any(|w| w == b"xn--"));
+        // The question section (after the 12-byte header) should contain
+        // the raw "🔥" UTF-8 bytes length-prefixed.
+        let fire = "🔥".as_bytes();
+        assert_eq!(response[12] as usize, fire.len());
+        assert_eq!(&response[13..13 + fire.len()], fire);
     }
 
     #[test]

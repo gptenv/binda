@@ -209,12 +209,13 @@ impl Node {
         }
     }
 
-    /// Bind a UDP socket speaking RFC 1035 DNS wire format, so legacy DNS
-    /// clients and resolvers can query this node directly (e.g. on the
-    /// classic port 53, if run with sufficient privilege).
+    /// Bind a UDP socket speaking BINDA's own native name-lookup wire
+    /// protocol (see [`dns`]): DNS-shaped framing, but every label is raw
+    /// UTF-8 on the wire — never Punycode/ASCII. This is a deliberate
+    /// break from RFC 1035 wire compatibility, not an oversight.
     pub async fn run_dns(&self, bind_addr: SocketAddr) -> std::io::Result<()> {
         let socket = UdpSocket::bind(bind_addr).await?;
-        println!("binda: DNS (RFC1035) listening on {bind_addr}");
+        println!("binda: native name-lookup protocol listening on {bind_addr}");
         let mut buf = vec![0u8; 512];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;

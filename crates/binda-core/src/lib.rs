@@ -34,8 +34,15 @@
 //! - [`api`] — glue applying an authenticated [`client_api::ClientRequest`]
 //!   to a [`store::RegistryStore`].
 //! - [`ntp`] — an NTP-disciplined [`liveness::TimeSource`].
-//! - [`punycode`] / [`dns`] — RFC 3492 and RFC 1035 wire compatibility, so
-//!   legacy DNS clients can resolve BINDA's Unicode-native names.
+//! - [`dns`] — BINDA's own name-lookup wire protocol: DNS-shaped framing
+//!   (header/question/answer, the same record types) but with UTF-8
+//!   labels carried natively on the wire. It is deliberately **not**
+//!   RFC 1035 compatible: BINDA exists to make Unicode names a first-class
+//!   citizen instead of forcing them through Punycode/IDNA ASCII
+//!   compatibility encoding, so this protocol never produces or accepts a
+//!   Punycode-encoded label. A legacy DNS resolver cannot speak it, by
+//!   design — a translating gateway, if one is ever wanted, is a separate
+//!   concern from this protocol's own wire format.
 
 pub mod api;
 pub mod client;
@@ -46,7 +53,6 @@ pub mod domain;
 pub mod gossip;
 pub mod liveness;
 pub mod ntp;
-pub mod punycode;
 pub mod resolver;
 pub mod store;
 pub mod token;

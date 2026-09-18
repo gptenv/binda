@@ -57,9 +57,13 @@ binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 --api 0.0.0.0:9532 \
 - `--api` — UDP address to listen on for the client-facing registration
   API: signed `Probe` / `Register` / `SetRecords` requests (see
   [`client_api`](crates/binda-core/src/client_api.rs)).
-- `--dns` — optional UDP address to also speak real RFC 1035 DNS wire
-  format on, so legacy resolvers can query BINDA directly (omit to skip
-  it; a production deployment would bind this to port 53).
+- `--dns` — optional UDP address to also speak BINDA's own native,
+  DNS-shaped name-lookup protocol on (see
+  [`dns`](crates/binda-core/src/dns.rs)): same message framing as classic
+  DNS, but every label is raw UTF-8 on the wire. It is **not** RFC 1035
+  wire-compatible and never produces or accepts Punycode/ASCII-compatible
+  encoding — that translation step is exactly what BINDA exists to make
+  unnecessary. Omit the flag to skip this listener entirely.
 - `--peer` — a known peer's gossip address; repeatable. Peers also learn
   about each other dynamically from inbound gossip, so only one bootstrap
   peer per new node is typically needed.
@@ -70,9 +74,10 @@ the raw local clock, since the whole liveness model depends on every node
 agreeing on roughly the same time.
 
 See [`examples/client_demo.rs`](crates/binda/examples/client_demo.rs) for
-a full walkthrough of a client: probe liveness, register a domain,
-publish an A record, then resolve it both via BINDA's own protocol and
-via a real DNS query.
+a full walkthrough of a client: probe liveness, register a Unicode
+domain, publish an A record, then resolve it both via BINDA's own
+resolver protocol and via BINDA's native, DNS-shaped protocol — proving
+the label crosses the wire as raw UTF-8, not Punycode.
 
 ```bash
 cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 &
@@ -82,16 +87,20 @@ cargo run -p binda --example client_demo
 ## Status
 
 Core registration, liveness, collision, gossip, zone-file, client API,
-NTP time, and RFC1035/punycode wire-compatibility types are implemented
-and unit-tested, and networking is wired up end-to-end: nodes gossip via
-UDP anti-entropy digests, and clients can probe/register/publish records
-over the client API and resolve via either BINDA's own protocol or real
-DNS wire format.
+NTP time, and native DNS-shaped wire-protocol types are implemented and
+unit-tested, and networking is wired up end-to-end: nodes gossip via UDP
+anti-entropy digests, and clients can probe/register/publish records over
+the client API and resolve via either BINDA's own JSON resolver protocol
+or its native DNS-shaped protocol — both fully Unicode-native, with no
+Punycode/ASCII-compatibility step anywhere in BINDA.
 
 Still missing/simplified, in rough priority order:
 
-- The DNS codec supports A/AAAA/CNAME/MX/TXT/NS over a single question,
-  no compression on the way in, no EDNS0, no zone transfers.
+- The native DNS-shaped codec supports A/AAAA/CNAME/MX/TXT/NS over a
+  single question, no compression on the way in, no EDNS0, no zone
+  transfers, and — being intentionally not RFC 1035 compatible — no
+  interoperability with legacy DNS resolvers (a translating gateway, if
+  ever wanted, would be a separate, optional component).
 - Gossip's "is this rumor newer" check compares timestamps only; it
   doesn't yet re-run collision resolution for rumors with an *equal or
   older* timestamp than a differing local claim, so some collisions only
