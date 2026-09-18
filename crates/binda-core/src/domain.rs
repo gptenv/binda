@@ -1,0 +1,131 @@
+//! Domain name handling.
+//!
+//! BINDA domain names operate natively on the full printable Unicode
+//! character set: emoji, combining-mark ("zalgo") sequences, and
+//! right-to-left scripts intermixed with left-to-right ones are all valid,
+//! as long as every scalar value is *printable* (i.e. not a control
+//! character and not an unassigned/format code point that would render
+//! invisibly or corrupt terminal state).
+
+use std::fmt;
+use thiserror::Error;
+
+/// A validated BINDA domain name (a single label or a dotted sequence of
+/// labels, exactly like a classic DNS name, but Unicode-native rather than
+/// punycode-encoded).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DomainName(String);
+
+/// Errors that can occur while validating a candidate domain name.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DomainNameError {
+    #[error("domain name must not be empty")]
+    Empty,
+    #[error("domain name exceeds the maximum length of {max} scalar values")]
+    TooLong { max: usize },
+    #[error("domain name contains a non-printable character at byte offset {offset}")]
+    NonPrintableChar { offset: usize },
+    #[error("domain label must not be empty (found consecutive or leading/trailing '.')")]
+    EmptyLabel,
+}
+
+/// Maximum length of a domain name, measured in Unicode scalar values.
+///
+/// Classic DNS caps names at 255 octets; since BINDA names can contain
+/// multi-byte scalars (including 4-byte emoji), the cap here is expressed
+/// in scalar values instead, matching the spirit of the original limit.
+pub const MAX_DOMAIN_SCALARS: usize = 255;
+
+impl DomainName {
+    /// Validate and construct a new [`DomainName`].
+    ///
+    /// A character is accepted unless it is a control character (Unicode
+    /// general category `Cc`) or the ASCII/Unicode space character; this
+    /// intentionally allows combining marks, emoji, emoji ZWJ sequences,
+    /// and mixed bidirectional scripts.
+    pub fn new(raw: impl Into<String>) -> Result<Self, DomainNameError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(DomainNameError::Empty);
+        }
+
+        let scalar_count = raw.chars().count();
+        if scalar_count > MAX_DOMAIN_SCALARS {
+            return Err(DomainNameError::TooLong {
+                max: MAX_DOMAIN_SCALARS,
+            });
+        }
+
+        for (offset, ch) in raw.char_indices() {
+            if ch.is_control() || ch == ' ' {
+                return Err(DomainNameError::NonPrintableChar { offset });
+            }
+        }
+
+        if raw.split('.').any(|label| label.is_empty()) {
+            return Err(DomainNameError::EmptyLabel);
+        }
+
+        Ok(Self(raw))
+    }
+
+    /// The dotted labels making up this domain name, outermost label first.
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        self.0.split('.')
+    }
+
+    /// The raw string form of the domain name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DomainName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for DomainName {
+    type Error = DomainNameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plain_ascii() {
+        assert!(DomainName::new("example.binda").is_ok());
+    }
+
+    #[test]
+    fn accepts_emoji_and_mixed_scripts() {
+        assert!(DomainName::new("🔥.example").is_ok());
+        assert!(DomainName::new("مرحبا.hello").is_ok());
+        assert!(DomainName::new("e\u{0301}\u{0301}\u{0301}xample").is_ok()); // zalgo-ish
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert_eq!(DomainName::new(""), Err(DomainNameError::Empty));
+    }
+
+    #[test]
+    fn rejects_control_chars() {
+        assert!(matches!(
+            DomainName::new("exa\u{0007}mple"),
+            Err(DomainNameError::NonPrintableChar { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_labels() {
+        assert_eq!(DomainName::new("a..b"), Err(DomainNameError::EmptyLabel));
+        assert_eq!(DomainName::new(".a"), Err(DomainNameError::EmptyLabel));
+    }
+}

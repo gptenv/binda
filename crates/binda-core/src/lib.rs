@@ -1,0 +1,42 @@
+//! # binda-core
+//!
+//! Core types and logic for **BINDA** ("bind10"): a free, self-sovereign,
+//! gossip-propagated DNS resolver and naming system intended to make
+//! traditional domain registrars unnecessary.
+//!
+//! This crate is transport- and I/O-agnostic: it defines domain names,
+//! client identities, the liveness/registration rules, the gossip message
+//! types, the collision-resolution protocol, and the TOML zone file
+//! format. The `binda` binary crate wires these into an actual network
+//! daemon.
+//!
+//! ## Model
+//!
+//! - [`domain`] — Unicode-native domain names (emoji, combining marks,
+//!   mixed bidirectional scripts all valid).
+//! - [`client`] — a client's identity: an Ed25519 keypair plus RDNS.
+//! - [`token`] — the timestamp + random-nonce token issued per
+//!   registration.
+//! - [`liveness`] — the 3-second liveness window and 5-domain-per-client
+//!   cap that a registration depends on.
+//! - [`collision`] — the mutual coin-negotiation protocol used when two
+//!   nodes learn of simultaneous claims on the same name.
+//! - [`gossip`] — the anti-entropy message types nodes exchange, and the
+//!   structural well-formedness check that stands in for a trust decision.
+//! - [`store`] — the in-memory registration table that ties the above
+//!   together.
+//! - [`zone`] — BIND9-equivalent zone data, serialized as TOML.
+
+pub mod client;
+pub mod collision;
+pub mod domain;
+pub mod gossip;
+pub mod liveness;
+pub mod store;
+pub mod token;
+pub mod zone;
+
+pub use client::ClientIdentity;
+pub use domain::DomainName;
+pub use store::RegistryStore;
+pub use zone::ZoneFile;
