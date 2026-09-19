@@ -3,7 +3,7 @@
 //! their current registration, keyed with a timestamp + random-nonce
 //! token to make collisions detectable and resolvable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::client::ClientIdentity;
 use crate::collision::negotiate_locally;
@@ -42,10 +42,9 @@ pub enum RegistrationError {
 #[derive(Debug, Default)]
 pub struct RegistryStore {
     registrations: HashMap<DomainName, Registration>,
-    /// Every authenticated claim for a quota subject, including claims
-    /// that currently lost the five-name selection. Keeping losers until
-    /// their lease expires prevents a peer from resurrecting them and lets
-    /// the next valid claim be promoted when a winner disappears.
+    /// The currently accepted authenticated claims for a quota subject.
+    /// Over-capacity claims are deliberately discarded at reconciliation:
+    /// they are rejected, not placed in a deferred-registration queue.
     quota_claims: HashMap<String, HashMap<DomainName, RegistrationRumor>>,
     liveness: LivenessTracker,
     probe_evidence: HashMap<String, (u64, Vec<u8>)>,
@@ -301,6 +300,8 @@ impl RegistryStore {
                 .then_with(|| a.domain.cmp(&b.domain))
         });
         winners.truncate(crate::liveness::MAX_REGISTRATIONS_PER_CLIENT);
+        let winner_domains: HashSet<_> = winners.iter().map(|rumor| rumor.domain.clone()).collect();
+        claims.retain(|domain, _| winner_domains.contains(domain));
         self.registrations
             .retain(|_, reg| reg.quota_key != quota || reg.rumor.is_none());
         for rumor in winners {
@@ -433,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_over_capacity_claim_is_promoted_after_old_winners_expire() {
+    fn over_capacity_claim_is_not_promoted_after_winners_expire() {
         let time = MockTimeSource::new(0);
         let mut store = RegistryStore::new();
         for i in 0..5 {
@@ -442,11 +443,19 @@ mod tests {
                 &time
             ));
         }
-        let fresh_at = crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1;
-        time.advance(std::time::Duration::from_millis(fresh_at));
         let replacement = DomainName::new("replacement.binda").unwrap();
-        assert!(store.adopt_rumor(signed_rumor(replacement.clone(), fresh_at), &time));
-        assert!(store.lookup(&replacement).is_some());
+        assert!(store.adopt_rumor(signed_rumor(replacement.clone(), 1), &time));
+        assert!(store.lookup(&replacement).is_none());
+        assert!(!store
+            .quota_claims
+            .get("shared.example.net")
+            .unwrap()
+            .contains_key(&replacement));
+        time.advance(std::time::Duration::from_millis(
+            crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 2,
+        ));
+        store.reclaim_stale(&time);
+        assert!(store.lookup(&replacement).is_none());
         assert!(store
             .lookup(&DomainName::new("old-0.binda").unwrap())
             .is_none());

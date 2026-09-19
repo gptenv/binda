@@ -31,9 +31,9 @@ within a 1-minute window.
   [`fcrdns`](crates/binda-core/src/fcrdns.rs)) — so the cap applies to a
   real, distinctly-controlled host rather than to a free-to-mint keypair.
   When separate instances concurrently learn more than five valid claims
-  for one host, every replica retains the signed candidates through their
-  normal lease expiry and deterministically exposes the same first five;
-  a later candidate is promoted when a winner expires.
+  for one host, every replica deterministically retains the same first
+  five and rejects the rest. A later vacancy is free for a new claim; it
+  never automatically promotes an earlier rejected registration.
 - **Full Unicode names, no length limit** — domain labels may use any
   printable Unicode scalar value: emoji, combining-mark ("zalgo")
   sequences, and mixed right-to-left/left-to-right scripts (intermixed
