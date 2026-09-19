@@ -440,6 +440,34 @@ mod tests {
     }
 
     #[test]
+    fn builds_answer_with_ns_record() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_NS,
+            qclass: CLASS_IN,
+        };
+        let record = Record {
+            name: "@".into(),
+            record_type: RecordType::Ns,
+            ttl_secs: 300,
+            value: "ns1.example.binda".into(),
+        };
+        let response = build_response(&query, true, &[record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+        assert!(record_matches_qtype(
+            &Record {
+                name: "@".into(),
+                record_type: RecordType::Ns,
+                ttl_secs: 300,
+                value: "ns1.example.binda".into(),
+            },
+            TYPE_NS
+        ));
+    }
+
+    #[test]
     fn builds_answer_with_mx_record_parsing_preference_prefix() {
         let query = DnsQuery {
             id: 1,

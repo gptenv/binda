@@ -212,13 +212,28 @@ mod tests {
 
     #[test]
     fn wrong_challenge_answer_is_distinguishable_from_correct() {
-        let challenge = ConformanceChallenge::random(2_000);
-        let correct = challenge.expected_answer();
-        let wrong = if correct == challenge.token_a {
-            challenge.token_b
-        } else {
-            challenge.token_a
-        };
-        assert_ne!(correct, wrong);
+        // Run enough rounds that the correct answer lands on token_a at
+        // least once and on token_b at least once, exercising both arms
+        // of picking "the other one" deterministically rather than
+        // leaving it to which way a single random challenge happened to
+        // fall.
+        let mut saw_a_correct = false;
+        let mut saw_b_correct = false;
+        for i in 0..200 {
+            let challenge = ConformanceChallenge::random(i);
+            let correct = challenge.expected_answer();
+            let wrong = if correct == challenge.token_a {
+                saw_a_correct = true;
+                challenge.token_b
+            } else {
+                saw_b_correct = true;
+                challenge.token_a
+            };
+            assert_ne!(correct, wrong);
+            if saw_a_correct && saw_b_correct {
+                break;
+            }
+        }
+        assert!(saw_a_correct && saw_b_correct);
     }
 }
