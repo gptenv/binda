@@ -989,4 +989,387 @@ mod tests {
         let response: ClientResponse = wire::decode(&buf[..len]).unwrap();
         assert!(matches!(response, ClientResponse::Registered { .. }));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_allowing_any_rdns_constructs_a_working_node() {
+        // Exercises the public constructor directly (main() is the only
+        // other caller, and it's excluded from coverage), rather than
+        // going through the test-only struct-literal helper.
+        let node = Node::new_allowing_any_rdns(Vec::new());
+        assert!(node
+            .store
+            .lock()
+            .await
+            .lookup(&DomainName::new("nobody.binda").unwrap())
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limiter_maintenance_prunes_stale_pending_challenges_but_keeps_fresh_ones() {
+        let node = test_node(Vec::new());
+        let fresh_peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let stale_peer: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        {
+            let mut pending = node.pending_challenges.lock().await;
+            pending.insert(
+                fresh_peer,
+                (ConformanceChallenge::random(0), Instant::now()),
+            );
+            let long_ago = Instant::now()
+                .checked_sub(PENDING_CHALLENGE_TIMEOUT + Duration::from_secs(1))
+                .expect("test process has been up long enough for this");
+            pending.insert(stale_peer, (ConformanceChallenge::random(0), long_ago));
+        }
+
+        node.spawn_rate_limiter_maintenance();
+        // The maintenance loop's first tick fires immediately (tokio
+        // interval semantics), so a short wait is enough to observe it.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        let pending = node.pending_challenges.lock().await;
+        assert!(pending.contains_key(&fresh_peer));
+        assert!(!pending.contains_key(&stale_peer));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_push_loop_idles_safely_with_no_known_peers() {
+        let gossip_addr: SocketAddr = "127.0.0.1:29610".parse().unwrap();
+        let node = test_node(Vec::new());
+        seed_registration(
+            &node,
+            &DomainName::new("has-data-but-no-peers.binda").unwrap(),
+        )
+        .await;
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_gossip(gossip_addr).await;
+        });
+        // Long enough for several push-loop ticks; nothing to assert on
+        // directly (there's no peer to send to), this just proves the
+        // loop doesn't panic or block when self.peers.random_peer()
+        // returns None every time.
+        tokio::time::sleep(GOSSIP_INTERVAL * 2 + StdDuration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_recv_loop_ignores_garbage_bytes_and_keeps_working() {
+        let gossip_addr: SocketAddr = "127.0.0.1:29611".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_gossip(gossip_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(b"not a gossip message", gossip_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        // The loop must have survived the garbage: a well-formed message
+        // sent right after should still get a real reply.
+        let digest = GossipMessage::Digest {
+            rumors: vec![DigestEntry {
+                domain: DomainName::new("after-garbage.binda").unwrap(),
+                issued_at_millis: u64::MAX,
+            }],
+        };
+        socket
+            .send_to(&wire::encode(&digest).unwrap(), gossip_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        let (len, _) = tokio::time::timeout(StdDuration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .expect("node should still respond after ignoring garbage")
+            .unwrap();
+        assert!(wire::decode::<GossipMessage>(&buf[..len]).is_ok());
+    }
+
+    // A dedicated "oversized Digest ignored by the running gossip loop"
+    // integration test isn't practical: encoding MAX_DIGEST_ENTRIES + 1
+    // entries (even with minimal one-character domain names) costs far
+    // more than MAX_DATAGRAM_BYTES in JSON overhead alone, so
+    // wire::decode's own size cap always rejects such a message before
+    // is_well_formed ever gets to. That rejection (not is_well_formed)
+    // is exactly what gossip_recv_loop_ignores_garbage_bytes_and_keeps_working
+    // exercises. is_well_formed's own oversized-rejection logic is
+    // covered directly in binda_core::gossip's unit tests instead, where
+    // it doesn't have to survive a real wire encode/decode round trip.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_rate_limiter_drops_traffic_past_the_burst() {
+        let gossip_addr: SocketAddr = "127.0.0.1:29613".parse().unwrap();
+        let node = test_node(Vec::new());
+        seed_registration(&node, &DomainName::new("rate-limit-gossip.binda").unwrap()).await;
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_gossip(gossip_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = GossipMessage::Request {
+            domains: vec![DomainName::new("rate-limit-gossip.binda").unwrap()],
+            challenge: ConformanceChallenge::random(0),
+        };
+        let bytes = wire::encode(&request).unwrap();
+
+        // Fire well past the burst size in a tight loop from the same
+        // source address; some of these must be dropped outright.
+        for _ in 0..40 {
+            let _ = socket.send_to(&bytes, gossip_addr).await;
+        }
+
+        let mut received = 0;
+        loop {
+            let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+            match tokio::time::timeout(StdDuration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert!(
+            received < 40,
+            "expected the rate limiter to drop some of 40 rapid requests, got {received} replies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_rate_limiter_drops_traffic_past_the_burst() {
+        use binda_core::resolver::ResolveQuery;
+
+        let resolver_addr: SocketAddr = "127.0.0.1:29614".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_resolver(resolver_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = ResolveQuery {
+            domain: DomainName::new("whatever.binda").unwrap(),
+        };
+        let bytes = wire::encode(&query).unwrap();
+        for _ in 0..40 {
+            let _ = socket.send_to(&bytes, resolver_addr).await;
+        }
+
+        let mut received = 0;
+        loop {
+            let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+            match tokio::time::timeout(StdDuration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert!(
+            received < 40,
+            "expected the rate limiter to drop some of 40 rapid queries, got {received} replies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_ignores_undecodable_bytes_and_keeps_working() {
+        use binda_core::resolver::{ResolveAnswer, ResolveQuery};
+
+        let resolver_addr: SocketAddr = "127.0.0.1:29615".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_resolver(resolver_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_socket
+            .set_read_timeout(Some(StdDuration::from_secs(3)))
+            .unwrap();
+        client_socket.send_to(b"garbage", resolver_addr).unwrap();
+        std::thread::sleep(StdDuration::from_millis(100));
+
+        let query = ResolveQuery {
+            domain: DomainName::new("after-garbage.binda").unwrap(),
+        };
+        client_socket
+            .send_to(&wire::encode(&query).unwrap(), resolver_addr)
+            .unwrap();
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        let (len, _) = client_socket.recv_from(&mut buf).unwrap();
+        let answer: ResolveAnswer = wire::decode(&buf[..len]).unwrap();
+        assert_eq!(answer.owner_client_key, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_api_rate_limiter_drops_traffic_past_the_burst() {
+        use binda_core::client_api::{probe_message, ClientRequest, ProbeBody, SignedEnvelope};
+        use ed25519_dalek::Signer;
+
+        let api_addr: SocketAddr = "127.0.0.1:29616".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_client_api(api_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let t = node.time.now_millis();
+        let msg = probe_message(t);
+        let sig = signing_key.sign(&msg);
+        let req = ClientRequest::Probe(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: "host.example.net".into(),
+            timestamp_millis: t,
+            signature: sig.to_bytes().to_vec(),
+            body: ProbeBody,
+        });
+        let bytes = wire::encode(&req).unwrap();
+        for _ in 0..40 {
+            let _ = socket.send_to(&bytes, api_addr).await;
+        }
+
+        let mut received = 0;
+        loop {
+            let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+            match tokio::time::timeout(StdDuration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert!(
+            received < 40,
+            "expected the rate limiter to drop some of 40 rapid requests, got {received} replies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_api_ignores_undecodable_bytes_and_keeps_working() {
+        use binda_core::client_api::{
+            probe_message, ClientRequest, ClientResponse, ProbeBody, SignedEnvelope,
+        };
+        use ed25519_dalek::Signer;
+
+        let api_addr: SocketAddr = "127.0.0.1:29617".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_client_api(api_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_socket
+            .set_read_timeout(Some(StdDuration::from_secs(3)))
+            .unwrap();
+        client_socket.send_to(b"garbage", api_addr).unwrap();
+        std::thread::sleep(StdDuration::from_millis(100));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let t = node.time.now_millis();
+        let msg = probe_message(t);
+        let sig = signing_key.sign(&msg);
+        let req = ClientRequest::Probe(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: "host.example.net".into(),
+            timestamp_millis: t,
+            signature: sig.to_bytes().to_vec(),
+            body: ProbeBody,
+        });
+        client_socket
+            .send_to(&wire::encode(&req).unwrap(), api_addr)
+            .unwrap();
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        let (len, _) = client_socket.recv_from(&mut buf).unwrap();
+        let response: ClientResponse = wire::decode(&buf[..len]).unwrap();
+        assert_eq!(response, ClientResponse::ProbeAck);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dns_rate_limiter_drops_traffic_past_the_burst() {
+        let dns_addr: SocketAddr = "127.0.0.1:29618".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_dns(dns_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut query = Vec::new();
+        query.extend(0x1234u16.to_be_bytes());
+        query.extend(0x0100u16.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+        query.extend([0u8; 6]);
+        query.extend(4u32.to_be_bytes());
+        query.extend(b"test");
+        query.extend(0u32.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+
+        for _ in 0..40 {
+            let _ = socket.send_to(&query, dns_addr).await;
+        }
+
+        let mut received = 0;
+        loop {
+            let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+            match tokio::time::timeout(StdDuration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert!(
+            received < 40,
+            "expected the rate limiter to drop some of 40 rapid queries, got {received} replies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_dns_loop_returns_nxdomain_for_unknown_domain() {
+        let dns_addr: SocketAddr = "127.0.0.1:29619".parse().unwrap();
+        let node = test_node(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_dns(dns_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_socket
+            .set_read_timeout(Some(StdDuration::from_secs(3)))
+            .unwrap();
+        let mut query = Vec::new();
+        query.extend(0x4321u16.to_be_bytes());
+        query.extend(0x0100u16.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+        query.extend([0u8; 6]);
+        for label in "nobody-registered-this.binda".split('.') {
+            let bytes = label.as_bytes();
+            query.extend((bytes.len() as u32).to_be_bytes());
+            query.extend(bytes);
+        }
+        query.extend(0u32.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+
+        client_socket.send_to(&query, dns_addr).unwrap();
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        let (len, _) = client_socket.recv_from(&mut buf).unwrap();
+        let response = &buf[..len];
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert_eq!(flags & 0x000F, 3); // RCODE_NXDOMAIN
+    }
 }
