@@ -470,6 +470,7 @@ mod tests {
     use binda_core::client::ClientIdentity;
     use binda_core::domain::DomainName;
     use binda_core::liveness::SystemTimeSource;
+    use binda_core::token::RegistrationToken;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::time::Duration as StdDuration;
@@ -924,6 +925,10 @@ mod tests {
         client_socket
             .set_read_timeout(Some(StdDuration::from_secs(3)))
             .unwrap();
+        // With no complete message ID there is no error response that can be
+        // addressed back to the sender; the listener must simply continue.
+        client_socket.send_to(&[0x99], dns_addr).unwrap();
+        std::thread::sleep(StdDuration::from_millis(50));
         // A 2-byte message can't possibly be a valid query, but it does
         // carry a recognizable ID for the error response to echo.
         client_socket.send_to(&[0x99, 0x88], dns_addr).unwrap();
@@ -1136,6 +1141,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn pending_challenge_table_evicts_oldest_peer_at_capacity() {
+        let node = test_node(Vec::new());
+        let oldest_peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let newest_peer: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let incoming_peer: SocketAddr = "127.0.0.1:20000".parse().unwrap();
+        {
+            let mut pending = node.pending_challenges.lock().await;
+            for port in 1..=MAX_PENDING_CHALLENGES as u16 {
+                pending.insert(
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    (
+                        ConformanceChallenge::random(port as u64),
+                        Vec::new(),
+                        Instant::now(),
+                    ),
+                );
+            }
+            // Make the ordering deterministic without waiting for the
+            // timeout-based maintenance task.
+            let oldest = pending.get_mut(&oldest_peer).unwrap();
+            oldest.2 = Instant::now()
+                .checked_sub(PENDING_CHALLENGE_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+            let newest = pending.get_mut(&newest_peer).unwrap();
+            newest.2 = Instant::now();
+        }
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let domain = DomainName::new("capacity-eviction.binda").unwrap();
+        node.handle_gossip_message(
+            &socket,
+            incoming_peer,
+            GossipMessage::Digest {
+                rumors: vec![DigestEntry {
+                    domain,
+                    issued_at_millis: u64::MAX,
+                }],
+            },
+        )
+        .await;
+
+        let pending = node.pending_challenges.lock().await;
+        assert_eq!(pending.len(), MAX_PENDING_CHALLENGES);
+        assert!(!pending.contains_key(&oldest_peer));
+        assert!(pending.contains_key(&newest_peer));
+        assert!(pending.contains_key(&incoming_peer));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn gossip_push_loop_idles_safely_with_no_known_peers() {
         let gossip_addr: SocketAddr = "127.0.0.1:29610".parse().unwrap();
         let node = test_node(Vec::new());
@@ -1165,6 +1219,37 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        // A decodable message with duplicate domains is also invalid at the
+        // protocol layer. The listener must drop it and continue serving the
+        // next valid exchange.
+        let duplicate_domain = DomainName::new("duplicate.binda").unwrap();
+        let duplicate_digest = GossipMessage::Digest {
+            rumors: vec![
+                DigestEntry {
+                    domain: duplicate_domain.clone(),
+                    issued_at_millis: 1,
+                },
+                DigestEntry {
+                    domain: duplicate_domain,
+                    issued_at_millis: 2,
+                },
+            ],
+        };
+        socket
+            .send_to(&wire::encode(&duplicate_digest).unwrap(), gossip_addr)
+            .await
+            .unwrap();
+
+        // A rumor without an outstanding request must likewise be ignored.
+        let unsolicited = GossipMessage::Rumors {
+            rumors: Vec::new(),
+            challenge_answer: RegistrationToken::issue(0),
+        };
+        socket
+            .send_to(&wire::encode(&unsolicited).unwrap(), gossip_addr)
+            .await
+            .unwrap();
 
         // The loop must have survived the garbage: a well-formed message
         // sent right after should still get a real reply.
