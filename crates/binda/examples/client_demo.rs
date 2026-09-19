@@ -3,6 +3,12 @@
 //! resolver protocol and via BINDA's native DNS-shaped wire protocol
 //! (which carries the label as raw UTF-8 — no Punycode involved).
 //!
+//! Note: the `rdns` claimed below (`client-demo.example.net`) almost
+//! certainly won't forward-confirm against wherever you actually run
+//! this from (see `binda_core::fcrdns`), so `register` is expected to
+//! come back as an `Error` unless you edit `rdns` to a hostname that
+//! genuinely resolves back to your machine's real source IP.
+//!
 //! Run a node first, then this example against it:
 //!
 //! ```bash

@@ -8,6 +8,7 @@ use std::time::Duration;
 use binda_core::api::handle_client_request;
 use binda_core::client_api::ClientRequest;
 use binda_core::dns;
+use binda_core::fcrdns::{self, RdnsVerifier};
 use binda_core::gossip::{is_well_formed, DigestEntry, GossipMessage, RegistrationRumor};
 use binda_core::liveness::TimeSource;
 use binda_core::ntp::NtpTimeSource;
@@ -263,9 +264,28 @@ impl Node {
             let Ok(request) = wire::decode::<ClientRequest>(&buf[..len]) else {
                 continue;
             };
+
+            // Only a Register actually needs this (it's what the "5
+            // domains per live socket" cap gates), and it's a real,
+            // blocking network round-trip against the public DNS system,
+            // so it runs off the async runtime's worker threads and
+            // (crucially) before the store's lock is ever taken.
+            let rdns_verified = match &request {
+                ClientRequest::Register(envelope) => {
+                    let source_ip = from.ip();
+                    let claimed_rdns = envelope.rdns.clone();
+                    tokio::task::spawn_blocking(move || {
+                        fcrdns::FcrdnsVerifier.verify(source_ip, &claimed_rdns)
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+                _ => true,
+            };
+
             let response = {
                 let mut store = self.store.lock().await;
-                handle_client_request(&mut store, self.time.as_ref(), request)
+                handle_client_request(&mut store, self.time.as_ref(), request, rdns_verified)
             };
             if let Ok(bytes) = wire::encode(&response) {
                 let _ = socket.send_to(&bytes, from).await;

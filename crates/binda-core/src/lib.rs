@@ -34,6 +34,9 @@
 //! - [`api`] — glue applying an authenticated [`client_api::ClientRequest`]
 //!   to a [`store::RegistryStore`].
 //! - [`ntp`] — an NTP-disciplined [`liveness::TimeSource`].
+//! - [`fcrdns`] — forward-confirmed reverse DNS verification: makes a
+//!   client's claimed RDNS hostname mean something by checking it against
+//!   the public DNS system, before it can back a registration.
 //! - [`rate_limit`] — a per-key token-bucket limiter, used instead of a
 //!   hard message-size cap to throttle abusive senders without punishing
 //!   a single large-but-legitimate message.
@@ -53,6 +56,7 @@ pub mod client_api;
 pub mod collision;
 pub mod dns;
 pub mod domain;
+pub mod fcrdns;
 pub mod gossip;
 pub mod liveness;
 pub mod ntp;
