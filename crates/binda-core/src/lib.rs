@@ -17,7 +17,7 @@
 //! - [`client`] — a client's identity: an Ed25519 keypair plus RDNS.
 //! - [`token`] — the timestamp + random-nonce token issued per
 //!   registration.
-//! - [`liveness`] — the 3-second liveness window and 5-domain-per-client
+//! - [`liveness`] — the 1-minute liveness window and 5-domain-per-client
 //!   cap that a registration depends on.
 //! - [`collision`] — the mutual coin-negotiation protocol used when two
 //!   nodes learn of simultaneous claims on the same name.
@@ -34,6 +34,9 @@
 //! - [`api`] — glue applying an authenticated [`client_api::ClientRequest`]
 //!   to a [`store::RegistryStore`].
 //! - [`ntp`] — an NTP-disciplined [`liveness::TimeSource`].
+//! - [`rate_limit`] — a per-key token-bucket limiter, used instead of a
+//!   hard message-size cap to throttle abusive senders without punishing
+//!   a single large-but-legitimate message.
 //! - [`dns`] — BINDA's own name-lookup wire protocol: DNS-shaped framing
 //!   (header/question/answer, the same record types) but with UTF-8
 //!   labels carried natively on the wire. It is deliberately **not**
@@ -53,6 +56,7 @@ pub mod domain;
 pub mod gossip;
 pub mod liveness;
 pub mod ntp;
+pub mod rate_limit;
 pub mod resolver;
 pub mod store;
 pub mod token;

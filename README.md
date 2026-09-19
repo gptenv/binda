@@ -3,11 +3,12 @@
 BINDA is a Rust-native DNS resolver and naming system designed to make
 traditional domain registrars unnecessary: anyone can register a free
 domain name and keep it for as long as they answer a liveliness probe
-within a 3-second window.
+within a 1-minute window.
 
 - **Free-for-life registration** — a domain stays yours as long as you
-  respond to a liveness probe within 3 seconds; miss the window and it
-  falls back into the pool.
+  respond to a liveness probe within a minute; miss the window and it
+  falls back into the pool. (Originally a stricter 3 seconds; relaxed to
+  give room for ordinary reconfiguration downtime.)
 - **Squatting resistance** — a maximum of 5 live registrations per client,
   where a client is identified by an Ed25519 signature combined with its
   reverse-DNS hostname.
@@ -112,6 +113,13 @@ Still missing/simplified, in rough priority order:
 - No persistence: every node's registry is purely in-memory and starts
   empty on restart, by design ("temporary... in-memory datastore"), but
   there's no snapshot/replay to speed up rejoining a network either.
-- No rate limiting or proof-of-work on the client API or DNS listeners
-  beyond the per-client registration cap; a network-facing deployment
-  would want to add some before being exposed to the open internet.
+- Every UDP listener (gossip, resolver, client API, native name-lookup)
+  is now rate-limited per source address via a token bucket (see
+  [`rate_limit`](crates/binda-core/src/rate_limit.rs)) rather than a hard
+  message-size cap — a deliberate choice so a single large-but-legitimate
+  message (an extravagant zalgo name, say) is never penalized, while a
+  sender flooding a listener gets throttled. `MAX_DATAGRAM_BYTES` still
+  exists, but only as the actual physical UDP payload ceiling
+  (65,507 bytes), not a policy limit. Source addresses are still
+  spoofable, so this doesn't stop a distributed flood; it's a first line
+  of defense, not the whole story.

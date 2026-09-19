@@ -11,6 +11,7 @@ use binda_core::dns;
 use binda_core::gossip::{is_well_formed, DigestEntry, GossipMessage, RegistrationRumor};
 use binda_core::liveness::TimeSource;
 use binda_core::ntp::NtpTimeSource;
+use binda_core::rate_limit::RateLimiter;
 use binda_core::resolver::{ResolveAnswer, ResolveQuery};
 use binda_core::store::RegistryStore;
 use binda_core::wire;
@@ -23,12 +24,39 @@ use crate::peers::PeerBook;
 /// How often a node pushes a gossip digest to one randomly-chosen peer.
 const GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Burst size and steady-state rate for each listener's per-source-address
+/// rate limiter. These throttle *volume from one sender*, which is the
+/// actual abuse this project cares about, rather than capping the size of
+/// any single message (see [`binda_core::rate_limit`]).
+const RATE_LIMIT_BURST: u32 = 20;
+const RATE_LIMIT_PER_SEC: f64 = 10.0;
+/// Cap on distinct source addresses a limiter tracks at once, so spraying
+/// spoofed source addresses can't grow the limiter's own memory without
+/// bound (the least-recently-seen address is evicted to make room).
+const RATE_LIMIT_MAX_TRACKED_KEYS: usize = 100_000;
+/// How often the maintenance task prunes rate limiter entries that have
+/// gone quiet, and how old an entry has to be to qualify.
+const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+const RATE_LIMIT_PRUNE_AGE: Duration = Duration::from_secs(300);
+
+fn new_rate_limiter() -> Mutex<RateLimiter<SocketAddr>> {
+    Mutex::new(RateLimiter::new(
+        RATE_LIMIT_BURST,
+        RATE_LIMIT_PER_SEC,
+        RATE_LIMIT_MAX_TRACKED_KEYS,
+    ))
+}
+
 /// Shared node state, cheap to clone (everything behind `Arc`).
 #[derive(Clone)]
 pub struct Node {
     pub store: Arc<Mutex<RegistryStore>>,
     pub peers: Arc<PeerBook>,
     pub time: Arc<dyn TimeSource>,
+    gossip_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
+    resolver_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
+    api_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
+    dns_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
 }
 
 impl Node {
@@ -42,7 +70,34 @@ impl Node {
             store: Arc::new(Mutex::new(RegistryStore::new())),
             peers: Arc::new(PeerBook::new(peers)),
             time,
+            gossip_limiter: Arc::new(new_rate_limiter()),
+            resolver_limiter: Arc::new(new_rate_limiter()),
+            api_limiter: Arc::new(new_rate_limiter()),
+            dns_limiter: Arc::new(new_rate_limiter()),
         }
+    }
+
+    /// Spawn a background task that periodically prunes every listener's
+    /// rate limiter of addresses that have gone quiet. Not required for
+    /// memory safety (each limiter already bounds its own size), just
+    /// keeps the tracked set closer to "currently active."
+    pub fn spawn_rate_limiter_maintenance(&self) {
+        let limiters = [
+            self.gossip_limiter.clone(),
+            self.resolver_limiter.clone(),
+            self.api_limiter.clone(),
+            self.dns_limiter.clone(),
+        ];
+        tokio::spawn(async move {
+            let mut ticker = interval(RATE_LIMIT_PRUNE_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let now = std::time::Instant::now();
+                for limiter in &limiters {
+                    limiter.lock().await.prune_older_than(RATE_LIMIT_PRUNE_AGE, now);
+                }
+            }
+        });
     }
 
     /// Bind the gossip UDP socket and run both the periodic digest-push
@@ -91,6 +146,9 @@ impl Node {
         let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
+            if !self.gossip_limiter.lock().await.allow(from) {
+                continue;
+            }
             let Ok(msg) = wire::decode::<GossipMessage>(&buf[..len]) else {
                 // Not decodable as our protocol: for this exchange, treat
                 // the sender as not-a-BINDA-node and drop it silently.
@@ -165,6 +223,9 @@ impl Node {
         let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
+            if !self.resolver_limiter.lock().await.allow(from) {
+                continue;
+            }
             let Ok(query) = wire::decode::<ResolveQuery>(&buf[..len]) else {
                 continue;
             };
@@ -196,6 +257,9 @@ impl Node {
         let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
+            if !self.api_limiter.lock().await.allow(from) {
+                continue;
+            }
             let Ok(request) = wire::decode::<ClientRequest>(&buf[..len]) else {
                 continue;
             };
@@ -222,6 +286,9 @@ impl Node {
         let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
+            if !self.dns_limiter.lock().await.allow(from) {
+                continue;
+            }
             let query = match dns::parse_query(&buf[..len]) {
                 Ok(query) => query,
                 Err(_) => {

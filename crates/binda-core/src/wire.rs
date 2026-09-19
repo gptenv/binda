@@ -3,16 +3,25 @@
 //! Encoding is JSON: this is a young protocol under active change, and
 //! human-readable frames make it far easier to debug with a packet dump
 //! than a binary format would, at a bandwidth cost this project is happy
-//! to pay for now. Datagrams are capped at [`MAX_DATAGRAM_BYTES`] so a
-//! malformed or hostile peer can't force unbounded allocation on decode.
+//! to pay for now.
+//!
+//! [`MAX_DATAGRAM_BYTES`] is not a policy choice about how big a BINDA
+//! message is allowed to be — BINDA imposes no such limit (see
+//! [`crate::domain`]). It's the actual physical ceiling on a single UDP
+//! datagram: an IPv4 UDP payload cannot exceed 65,507 bytes no matter what
+//! any application wants, so refusing to allocate for anything claiming
+//! to be bigger than that costs nothing (it's already impossible to
+//! receive) while still bounding decode-time allocation. Throttling an
+//! abusive *sender* — as opposed to a single large message — is instead
+//! [`crate::rate_limit`]'s job.
 
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
-/// Maximum size, in bytes, of a single encoded wire message. Chosen to sit
-/// comfortably under the practical UDP datagram size most networks pass
-/// without fragmentation.
-pub const MAX_DATAGRAM_BYTES: usize = 60_000;
+/// The maximum possible size of a single UDP datagram's payload over
+/// IPv4 (65,535-byte max IP packet, minus the 8-byte UDP header and
+/// 20-byte minimum IPv4 header). Not an application-chosen limit.
+pub const MAX_DATAGRAM_BYTES: usize = 65_507;
 
 #[derive(Debug, Error)]
 pub enum WireError {

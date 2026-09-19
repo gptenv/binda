@@ -99,6 +99,7 @@ async fn main() -> std::io::Result<()> {
     println!("binda (bind10) — starting node");
 
     let node = Node::new(args.peers);
+    node.spawn_rate_limiter_maintenance();
     println!("binda: known peers at startup: {:?}", node.peers.snapshot().await);
 
     let gossip_node = node.clone();

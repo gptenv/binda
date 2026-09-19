@@ -227,7 +227,7 @@ mod tests {
         let domain = DomainName::new("example.binda").unwrap();
         store.register(domain.clone(), &c, &time).unwrap();
 
-        time.advance(std::time::Duration::from_millis(3001));
+        time.advance(std::time::Duration::from_millis(crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1));
         store.reclaim_stale(&time);
         assert!(store.lookup(&domain).is_none());
     }

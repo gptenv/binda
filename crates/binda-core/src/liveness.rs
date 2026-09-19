@@ -11,8 +11,10 @@ use std::time::Duration;
 use crate::client::ClientIdentity;
 
 /// The maximum gap allowed between successive liveness probes before a
-/// client's registrations are considered abandoned.
-pub const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
+/// client's registrations are considered abandoned. Originally 3 seconds;
+/// relaxed to a minute so a client reconfiguring its infrastructure has
+/// some real slack before losing its name.
+pub const LIVENESS_WINDOW: Duration = Duration::from_secs(60);
 
 /// The maximum number of live domain registrations a single client
 /// identity may hold at once, enforced while it remains within
@@ -163,7 +165,7 @@ mod tests {
         let mut tracker = LivenessTracker::new();
         let c = client();
         tracker.record_probe(&c, &time);
-        time.advance(Duration::from_millis(3001));
+        time.advance(Duration::from_millis(LIVENESS_WINDOW.as_millis() as u64 + 1));
         assert!(!tracker.is_live(&c, &time));
     }
 
