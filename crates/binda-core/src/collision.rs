@@ -97,18 +97,29 @@ pub fn resolve(
     }
 }
 
-/// Run a full simulated negotiation locally (both sides in-process), for
-/// testing and for single-node simulation of the network protocol.
-pub fn negotiate_locally(a: RegistrationToken, b: RegistrationToken) -> RegistrationToken {
-    let mut side_a = Negotiation::new();
-    let mut side_b = Negotiation::new();
-    loop {
-        let pa = side_a.propose();
-        let pb = side_b.propose();
-        if let Some(condition) = Negotiation::check_agreement(pa, pb) {
-            return resolve(condition, a, b);
-        }
+/// Derive the mutually-random collision condition from *both* claims.
+///
+/// Each registration token contributes an unpredictable nonce, while this
+/// symmetric reduction means every replica computes the same outcome from
+/// the same pair.  This replaces the old local simulation of two remote
+/// coin flips, which could make different gossip recipients retain
+/// different winners.
+pub fn mutually_derived_condition(a: RegistrationToken, b: RegistrationToken) -> WinCondition {
+    let parity = a.nonce.iter().chain(b.nonce.iter()).fold(
+        (a.issued_at_millis ^ b.issued_at_millis) as u8,
+        |acc, byte| acc ^ byte,
+    );
+    if parity & 1 == 0 {
+        WinCondition::HigherWins
+    } else {
+        WinCondition::LowerWins
     }
+}
+
+/// Resolve a collision in a way every node can reproduce from the two
+/// registration tokens alone.
+pub fn negotiate_locally(a: RegistrationToken, b: RegistrationToken) -> RegistrationToken {
+    resolve(mutually_derived_condition(a, b), a, b)
 }
 
 #[cfg(test)]
@@ -121,6 +132,23 @@ mod tests {
         let b = RegistrationToken::issue(2);
         let winner = negotiate_locally(a, b);
         assert!(winner == a || winner == b);
+    }
+
+    #[test]
+    fn mutually_derived_outcome_is_symmetric_and_convergent() {
+        let a = RegistrationToken {
+            issued_at_millis: 1,
+            nonce: [1; 8],
+        };
+        let b = RegistrationToken {
+            issued_at_millis: 2,
+            nonce: [2; 8],
+        };
+        assert_eq!(
+            mutually_derived_condition(a, b),
+            mutually_derived_condition(b, a)
+        );
+        assert_eq!(negotiate_locally(a, b), negotiate_locally(b, a));
     }
 
     #[test]

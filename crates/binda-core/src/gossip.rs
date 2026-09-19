@@ -27,9 +27,12 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::client::ClientIdentity;
+use crate::client_api::{probe_message, register_message, set_records_message};
 use crate::collision::{resolve, WinCondition};
 use crate::domain::DomainName;
 use crate::token::RegistrationToken;
+use crate::zone::Record;
 
 /// A single fact a node can gossip about: a domain's current registration
 /// state, as of a token.
@@ -38,6 +41,75 @@ pub struct RegistrationRumor {
     pub domain: DomainName,
     pub token: RegistrationToken,
     pub client_key: String,
+    /// The original owner-signed registration and most recent signed probe.
+    /// A rumor is an independently verifiable lease, never a peer assertion.
+    pub owner_key: Vec<u8>,
+    pub rdns: String,
+    pub registration_timestamp_millis: u64,
+    pub registration_signature: Vec<u8>,
+    pub probe_timestamp_millis: u64,
+    pub probe_signature: Vec<u8>,
+    pub records: Vec<Record>,
+    pub records_timestamp_millis: Option<u64>,
+    pub records_signature: Option<Vec<u8>>,
+}
+
+impl RegistrationRumor {
+    /// Validate all owner authorizations carried by this replicated lease.
+    /// The admission node remains responsible for FCrDNS at issuance time;
+    /// replicas validate the cryptographic fact and expiry without trusting
+    /// the gossip sender.
+    pub fn is_authorized(&self) -> bool {
+        let Ok(bytes) = <[u8; 32]>::try_from(self.owner_key.as_slice()) else {
+            return false;
+        };
+        let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&bytes) else {
+            return false;
+        };
+        let owner = ClientIdentity::new(key, self.rdns.clone());
+        if owner.key() != self.client_key {
+            return false;
+        }
+        let Ok(register_signature) =
+            ed25519_dalek::Signature::from_slice(&self.registration_signature)
+        else {
+            return false;
+        };
+        let Ok(probe_signature) = ed25519_dalek::Signature::from_slice(&self.probe_signature)
+        else {
+            return false;
+        };
+        if owner
+            .verify(
+                &register_message(&self.domain, self.registration_timestamp_millis),
+                &register_signature,
+            )
+            .is_err()
+            || owner
+                .verify(
+                    &probe_message(self.probe_timestamp_millis),
+                    &probe_signature,
+                )
+                .is_err()
+        {
+            return false;
+        }
+        match (self.records_timestamp_millis, &self.records_signature) {
+            (None, None) => self.records.is_empty(),
+            (Some(timestamp), Some(signature)) => {
+                let Ok(signature) = ed25519_dalek::Signature::from_slice(signature) else {
+                    return false;
+                };
+                owner
+                    .verify(
+                        &set_records_message(&self.domain, &self.records, timestamp),
+                        &signature,
+                    )
+                    .is_ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A behavioural test bundled into a [`GossipMessage::Request`]: answering
@@ -154,6 +226,27 @@ pub const MAX_REQUEST_ENTRIES: usize = 4096;
 mod tests {
     use super::*;
 
+    fn rumor(
+        domain: DomainName,
+        token: RegistrationToken,
+        client_key: impl Into<String>,
+    ) -> RegistrationRumor {
+        RegistrationRumor {
+            domain,
+            token,
+            client_key: client_key.into(),
+            owner_key: vec![],
+            rdns: String::new(),
+            registration_timestamp_millis: 0,
+            registration_signature: vec![],
+            probe_timestamp_millis: 0,
+            probe_signature: vec![],
+            records: vec![],
+            records_timestamp_millis: None,
+            records_signature: None,
+        }
+    }
+
     #[test]
     fn oversized_digest_is_rejected() {
         let rumors = (0..MAX_DIGEST_ENTRIES + 1)
@@ -201,10 +294,12 @@ mod tests {
     #[test]
     fn oversized_rumors_is_rejected() {
         let rumors = (0..MAX_DIGEST_ENTRIES + 1)
-            .map(|i| RegistrationRumor {
-                domain: DomainName::new(format!("d{i}.binda")).unwrap(),
-                token: RegistrationToken::issue(0),
-                client_key: "someone".to_string(),
+            .map(|i| {
+                rumor(
+                    DomainName::new(format!("d{i}.binda")).unwrap(),
+                    RegistrationToken::issue(0),
+                    "someone",
+                )
             })
             .collect();
         let msg = GossipMessage::Rumors {
@@ -217,11 +312,11 @@ mod tests {
     #[test]
     fn normal_rumors_is_accepted() {
         let msg = GossipMessage::Rumors {
-            rumors: vec![RegistrationRumor {
-                domain: DomainName::new("example.binda").unwrap(),
-                token: RegistrationToken::issue(0),
-                client_key: "someone".to_string(),
-            }],
+            rumors: vec![rumor(
+                DomainName::new("example.binda").unwrap(),
+                RegistrationToken::issue(0),
+                "someone",
+            )],
             challenge_answer: RegistrationToken::issue(0),
         };
         assert!(is_well_formed(&msg));
@@ -249,18 +344,14 @@ mod tests {
     fn rumor_response_must_be_request_scoped_and_unique() {
         let requested = vec![DomainName::new("requested.binda").unwrap()];
         let token = RegistrationToken::issue(1);
-        let valid = vec![RegistrationRumor {
-            domain: requested[0].clone(),
-            token,
-            client_key: "client".into(),
-        }];
+        let valid = vec![rumor(requested[0].clone(), token, "client")];
         assert!(is_valid_rumor_response(&requested, &valid));
 
-        let unrequested = vec![RegistrationRumor {
-            domain: DomainName::new("unrequested.binda").unwrap(),
+        let unrequested = vec![rumor(
+            DomainName::new("unrequested.binda").unwrap(),
             token,
-            client_key: "client".into(),
-        }];
+            "client",
+        )];
         assert!(!is_valid_rumor_response(&requested, &unrequested));
 
         let duplicate = vec![valid[0].clone(), valid[0].clone()];
