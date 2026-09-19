@@ -139,7 +139,12 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     let qclass = read_u16(bytes, pos)?;
 
     let domain = DomainName::new(labels.join("."))?;
-    Ok(DnsQuery { id, domain, qtype, qclass })
+    Ok(DnsQuery {
+        id,
+        domain,
+        qtype,
+        qclass,
+    })
 }
 
 fn encode_domain_labels(domain: &DomainName, out: &mut Vec<u8>) {

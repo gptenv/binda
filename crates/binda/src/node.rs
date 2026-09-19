@@ -10,7 +10,9 @@ use binda_core::api::handle_client_request;
 use binda_core::client_api::ClientRequest;
 use binda_core::dns;
 use binda_core::fcrdns::{self, RdnsVerifier};
-use binda_core::gossip::{is_well_formed, ConformanceChallenge, DigestEntry, GossipMessage, RegistrationRumor};
+use binda_core::gossip::{
+    is_well_formed, ConformanceChallenge, DigestEntry, GossipMessage, RegistrationRumor,
+};
 use binda_core::liveness::TimeSource;
 use binda_core::ntp::NtpTimeSource;
 use binda_core::rate_limit::RateLimiter;
@@ -112,12 +114,14 @@ impl Node {
                 ticker.tick().await;
                 let now = Instant::now();
                 for limiter in &limiters {
-                    limiter.lock().await.prune_older_than(RATE_LIMIT_PRUNE_AGE, now);
+                    limiter
+                        .lock()
+                        .await
+                        .prune_older_than(RATE_LIMIT_PRUNE_AGE, now);
                 }
-                pending_challenges
-                    .lock()
-                    .await
-                    .retain(|_, (_, issued_at)| now.duration_since(*issued_at) < PENDING_CHALLENGE_TIMEOUT);
+                pending_challenges.lock().await.retain(|_, (_, issued_at)| {
+                    now.duration_since(*issued_at) < PENDING_CHALLENGE_TIMEOUT
+                });
             }
         });
     }
@@ -184,7 +188,12 @@ impl Node {
         }
     }
 
-    async fn handle_gossip_message(&self, socket: &UdpSocket, from: SocketAddr, msg: GossipMessage) {
+    async fn handle_gossip_message(
+        &self,
+        socket: &UdpSocket,
+        from: SocketAddr,
+        msg: GossipMessage,
+    ) {
         match msg {
             GossipMessage::Digest { rumors } => {
                 let missing: Vec<_> = {
@@ -222,7 +231,10 @@ impl Node {
                     pending.insert(from, (challenge, Instant::now()));
                 }
 
-                let request = GossipMessage::Request { domains: missing, challenge };
+                let request = GossipMessage::Request {
+                    domains: missing,
+                    challenge,
+                };
                 if let Ok(bytes) = wire::encode(&request) {
                     let _ = socket.send_to(&bytes, from).await;
                 }
@@ -254,7 +266,10 @@ impl Node {
                     let _ = socket.send_to(&bytes, from).await;
                 }
             }
-            GossipMessage::Rumors { rumors, challenge_answer } => {
+            GossipMessage::Rumors {
+                rumors,
+                challenge_answer,
+            } => {
                 let expected = {
                     let mut pending = self.pending_challenges.lock().await;
                     pending.remove(&from)

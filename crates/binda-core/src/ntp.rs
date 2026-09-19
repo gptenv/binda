@@ -124,16 +124,23 @@ fn query_offset_millis(server: &str) -> io::Result<i64> {
     let mut packet = [0u8; 48];
     packet[0] = 0b00_100_011; // LI=0 (no warning), VN=4, Mode=3 (client)
 
-    let t1 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t1 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     write_ntp_timestamp(&mut packet[40..48], t1);
 
     socket.send(&packet)?;
     let mut reply = [0u8; 48];
     let n = socket.recv(&mut reply)?;
     if n < 48 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short NTP reply"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short NTP reply",
+        ));
     }
-    let t4 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t4 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
 
     // Receive Timestamp (T2): when the server received our request.
     let t2 = read_ntp_timestamp(&reply[32..40]);

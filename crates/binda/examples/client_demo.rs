@@ -20,8 +20,8 @@ use std::net::UdpSocket;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use binda_core::client_api::{
-    probe_message, register_message, set_records_message, ClientRequest, ClientResponse,
-    ProbeBody, RegisterBody, SetRecordsBody, SignedEnvelope,
+    probe_message, register_message, set_records_message, ClientRequest, ClientResponse, ProbeBody,
+    RegisterBody, SetRecordsBody, SignedEnvelope,
 };
 use binda_core::dns;
 use binda_core::domain::DomainName;
@@ -32,7 +32,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn send_recv<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
@@ -85,7 +88,9 @@ fn main() {
         rdns: rdns.clone(),
         timestamp_millis: t,
         signature: sig.to_bytes().to_vec(),
-        body: RegisterBody { domain: domain.clone() },
+        body: RegisterBody {
+            domain: domain.clone(),
+        },
     });
     let register_resp: ClientResponse = send_recv(&socket, api_addr, &register_req);
     println!("register -> {register_resp:?}");
@@ -114,8 +119,11 @@ fn main() {
     println!("set_records -> {set_records_resp:?}");
 
     // 4. Resolve via BINDA's own resolver protocol.
-    let query = ResolveQuery { domain: domain.clone() };
-    let answer: ResolveAnswer = send_recv(&socket, api_addr.replace("9532", "9531").as_str(), &query);
+    let query = ResolveQuery {
+        domain: domain.clone(),
+    };
+    let answer: ResolveAnswer =
+        send_recv(&socket, api_addr.replace("9532", "9531").as_str(), &query);
     println!("resolve (binda protocol) -> {answer:?}");
 
     // 5. Resolve the same domain via BINDA's native, DNS-shaped wire
@@ -136,13 +144,21 @@ fn main() {
     native_query.extend(1u16.to_be_bytes()); // QTYPE A
     native_query.extend(1u16.to_be_bytes()); // QCLASS IN
 
-    socket.send_to(&native_query, dns_addr).expect("send native query");
+    socket
+        .send_to(&native_query, dns_addr)
+        .expect("send native query");
     let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
     let (len, _) = socket.recv_from(&mut buf).expect("recv native response");
     let response = &buf[..len];
     let ancount = u16::from_be_bytes([response[6], response[7]]);
-    println!("resolve (BINDA native protocol) -> ANCOUNT={ancount}, {} bytes", response.len());
+    println!(
+        "resolve (BINDA native protocol) -> ANCOUNT={ancount}, {} bytes",
+        response.len()
+    );
     if let Ok(parsed) = dns::parse_query(&native_query) {
-        println!("  echoed query domain (raw UTF-8 on the wire): {}", parsed.domain);
+        println!(
+            "  echoed query domain (raw UTF-8 on the wire): {}",
+            parsed.domain
+        );
     }
 }

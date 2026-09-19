@@ -93,7 +93,11 @@ pub fn register_message(domain: &DomainName, timestamp_millis: u64) -> Vec<u8> {
 
 /// Build the canonical byte message a `SetRecords` request's signature
 /// covers.
-pub fn set_records_message(domain: &DomainName, records: &[Record], timestamp_millis: u64) -> Vec<u8> {
+pub fn set_records_message(
+    domain: &DomainName,
+    records: &[Record],
+    timestamp_millis: u64,
+) -> Vec<u8> {
     let mut msg = format!("binda-set-records:{domain}:{timestamp_millis}:").into_bytes();
     if let Ok(json) = serde_json::to_vec(records) {
         msg.extend(json);
@@ -165,7 +169,10 @@ mod tests {
             body: ProbeBody,
         };
         let far_future = 1000 + REQUEST_FRESHNESS_WINDOW_MILLIS + 1;
-        assert_eq!(authenticate(&envelope, &msg, far_future), Err(RequestAuthError::Stale));
+        assert_eq!(
+            authenticate(&envelope, &msg, far_future),
+            Err(RequestAuthError::Stale)
+        );
     }
 
     #[test]

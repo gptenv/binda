@@ -63,8 +63,10 @@ impl MockTimeSource {
     }
 
     pub fn advance(&self, delta: Duration) {
-        self.millis
-            .fetch_add(delta.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+        self.millis.fetch_add(
+            delta.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 }
 
@@ -89,7 +91,8 @@ impl LivenessTracker {
 
     /// Record a liveness probe response from `client` at the current time.
     pub fn record_probe(&mut self, client: &ClientIdentity, time: &dyn TimeSource) {
-        self.last_seen_millis.insert(client.key(), time.now_millis());
+        self.last_seen_millis
+            .insert(client.key(), time.now_millis());
     }
 
     /// Whether `client` has probed within [`LIVENESS_WINDOW`] of `time`'s
@@ -106,7 +109,10 @@ impl LivenessTracker {
 
     /// Current number of registrations attributed to `client`.
     pub fn registration_count(&self, client: &ClientIdentity) -> usize {
-        self.registration_counts.get(&client.key()).copied().unwrap_or(0)
+        self.registration_counts
+            .get(&client.key())
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether `client` may register one more domain: it must be live and
@@ -165,7 +171,9 @@ mod tests {
         let mut tracker = LivenessTracker::new();
         let c = client();
         tracker.record_probe(&c, &time);
-        time.advance(Duration::from_millis(LIVENESS_WINDOW.as_millis() as u64 + 1));
+        time.advance(Duration::from_millis(
+            LIVENESS_WINDOW.as_millis() as u64 + 1,
+        ));
         assert!(!tracker.is_live(&c, &time));
     }
 

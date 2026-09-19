@@ -91,11 +91,15 @@ pub fn reverse_lookup(ip: IpAddr, resolvers: &[&str]) -> io::Result<Vec<String>>
 }
 
 fn parse_a(data: &[u8]) -> Option<IpAddr> {
-    <[u8; 4]>::try_from(data).ok().map(|o| IpAddr::V4(Ipv4Addr::from(o)))
+    <[u8; 4]>::try_from(data)
+        .ok()
+        .map(|o| IpAddr::V4(Ipv4Addr::from(o)))
 }
 
 fn parse_aaaa(data: &[u8]) -> Option<IpAddr> {
-    <[u8; 16]>::try_from(data).ok().map(|o| IpAddr::V6(Ipv6Addr::from(o)))
+    <[u8; 16]>::try_from(data)
+        .ok()
+        .map(|o| IpAddr::V6(Ipv6Addr::from(o)))
 }
 
 type RdataParser = fn(&[u8]) -> Option<IpAddr>;
@@ -205,7 +209,10 @@ fn query(name: &str, qtype: u16, resolvers: &[&str]) -> io::Result<Vec<(u16, Vec
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, "no resolver answered"))
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "no resolver answered",
+    ))
 }
 
 fn send_and_receive(resolver: &str, request: &[u8]) -> io::Result<Vec<u8>> {
@@ -337,7 +344,9 @@ mod tests {
 
     impl RdnsVerifier for FakeVerifier {
         fn verify(&self, source_ip: IpAddr, claimed_rdns: &str) -> bool {
-            self.0.iter().any(|(ip, host)| *ip == source_ip && host == claimed_rdns)
+            self.0
+                .iter()
+                .any(|(ip, host)| *ip == source_ip && host == claimed_rdns)
         }
     }
 

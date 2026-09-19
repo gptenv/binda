@@ -100,7 +100,10 @@ async fn main() -> std::io::Result<()> {
 
     let node = Node::new(args.peers);
     node.spawn_rate_limiter_maintenance();
-    println!("binda: known peers at startup: {:?}", node.peers.snapshot().await);
+    println!(
+        "binda: known peers at startup: {:?}",
+        node.peers.snapshot().await
+    );
 
     let gossip_node = node.clone();
     let gossip_task = tokio::spawn(async move {

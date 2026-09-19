@@ -61,8 +61,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gossip::{DigestEntry, GossipMessage};
     use crate::domain::DomainName;
+    use crate::gossip::{DigestEntry, GossipMessage};
 
     #[test]
     fn round_trips_a_gossip_message() {

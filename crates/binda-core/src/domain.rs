@@ -20,7 +20,9 @@ use thiserror::Error;
 /// A validated BINDA domain name (a single label or a dotted sequence of
 /// labels, exactly like a classic DNS name, but Unicode-native rather than
 /// punycode-encoded).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct DomainName(String);
 
 /// Errors that can occur while validating a candidate domain name.
@@ -127,7 +129,8 @@ mod tests {
         // Not just an RTL label next to an LTR one (already covered above)
         // but Arabic and Latin characters interleaved within a *single*
         // label, exactly as the "intermixed" requirement calls for.
-        let domain = DomainName::new("helloمرحبا🔥world").expect("intermixed bidi label should be valid");
+        let domain =
+            DomainName::new("helloمرحبا🔥world").expect("intermixed bidi label should be valid");
         assert_eq!(domain.labels().count(), 1);
         assert_eq!(domain.as_str(), "helloمرحبا🔥world");
     }

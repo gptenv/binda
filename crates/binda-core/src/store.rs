@@ -120,7 +120,12 @@ impl RegistryStore {
 
     /// Attach zone records to a domain this node's own client already
     /// owns. Fails silently (no-op) if `client` does not hold `domain`.
-    pub fn set_records(&mut self, domain: &DomainName, client: &ClientIdentity, records: Vec<Record>) -> bool {
+    pub fn set_records(
+        &mut self,
+        domain: &DomainName,
+        client: &ClientIdentity,
+        records: Vec<Record>,
+    ) -> bool {
         match self.registrations.get_mut(domain) {
             Some(reg) if reg.client_key == client.key() => {
                 reg.records = records;
@@ -136,7 +141,12 @@ impl RegistryStore {
     /// issues locally. If the domain is already held here under a
     /// different claim, the two claims are arbitrated via the same mutual
     /// coin-negotiation protocol used for a live collision.
-    pub fn adopt_rumor(&mut self, domain: DomainName, client_key: String, token: RegistrationToken) {
+    pub fn adopt_rumor(
+        &mut self,
+        domain: DomainName,
+        client_key: String,
+        token: RegistrationToken,
+    ) {
         match self.registrations.get(&domain) {
             None => {
                 self.registrations.insert(
@@ -215,7 +225,10 @@ mod tests {
         let mut store = RegistryStore::new();
         let c = client();
         let domain = DomainName::new("example.binda").unwrap();
-        assert_eq!(store.register(domain, &c, &time), Err(RegistrationError::NotLive));
+        assert_eq!(
+            store.register(domain, &c, &time),
+            Err(RegistrationError::NotLive)
+        );
     }
 
     #[test]
@@ -227,7 +240,9 @@ mod tests {
         let domain = DomainName::new("example.binda").unwrap();
         store.register(domain.clone(), &c, &time).unwrap();
 
-        time.advance(std::time::Duration::from_millis(crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1));
+        time.advance(std::time::Duration::from_millis(
+            crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1,
+        ));
         store.reclaim_stale(&time);
         assert!(store.lookup(&domain).is_none());
     }

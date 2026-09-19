@@ -25,7 +25,9 @@ pub fn handle_client_request(
     let now = time.now_millis();
     match request {
         ClientRequest::Probe(envelope) => handle_probe(store, time, now, envelope),
-        ClientRequest::Register(envelope) => handle_register(store, time, now, envelope, rdns_verified),
+        ClientRequest::Register(envelope) => {
+            handle_register(store, time, now, envelope, rdns_verified)
+        }
         ClientRequest::SetRecords(envelope) => handle_set_records(store, now, envelope),
     }
 }
@@ -81,7 +83,11 @@ fn handle_set_records(
     now: u64,
     envelope: SignedEnvelope<SetRecordsBody>,
 ) -> ClientResponse {
-    let message = set_records_message(&envelope.body.domain, &envelope.body.records, envelope.timestamp_millis);
+    let message = set_records_message(
+        &envelope.body.domain,
+        &envelope.body.records,
+        envelope.timestamp_millis,
+    );
     match authenticate(&envelope, &message, now) {
         Ok(identity) => {
             if store.set_records(&envelope.body.domain, &identity, envelope.body.records) {
@@ -107,7 +113,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
-    fn envelope_register(signing_key: &SigningKey, domain: DomainName, timestamp: u64) -> ClientRequest {
+    fn envelope_register(
+        signing_key: &SigningKey,
+        domain: DomainName,
+        timestamp: u64,
+    ) -> ClientRequest {
         let message = register_message(&domain, timestamp);
         let signature = signing_key.sign(&message);
         ClientRequest::Register(SignedEnvelope {

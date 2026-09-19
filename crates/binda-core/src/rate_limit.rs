@@ -65,7 +65,9 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
             last_refill: now,
         });
 
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         bucket.last_refill = now;
 
