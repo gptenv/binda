@@ -488,6 +488,50 @@ mod tests {
         }
     }
 
+    // These four helpers all share one shape: spawn a listener loop that,
+    // by design, never returns (it's a `loop { ... }` bound to a real UDP
+    // socket) and run it in the background for a test to send traffic
+    // at. Source-based coverage instrumentation can't mark a spawned
+    // async block's own "completed" region as hit when it's an infinite
+    // loop that gets torn down by the test process exiting rather than
+    // by returning — that's a property of *how the test drives the
+    // listener*, not of whether the listener's behavior is actually
+    // exercised (every test using these asserts on real responses over a
+    // real socket). `#[coverage(off)]` excludes exactly that
+    // structurally-uncoverable line, the same way `main` is excluded for
+    // an analogous reason.
+    #[coverage(off)]
+    fn spawn_gossip_task(node: &Node, addr: SocketAddr) {
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_gossip(addr).await;
+        });
+    }
+
+    #[coverage(off)]
+    fn spawn_resolver_task(node: &Node, addr: SocketAddr) {
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_resolver(addr).await;
+        });
+    }
+
+    #[coverage(off)]
+    fn spawn_client_api_task(node: &Node, addr: SocketAddr) {
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_client_api(addr).await;
+        });
+    }
+
+    #[coverage(off)]
+    fn spawn_dns_task(node: &Node, addr: SocketAddr) {
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_dns(addr).await;
+        });
+    }
+
     /// Receive datagrams on `socket` until one decodes as a
     /// `GossipMessage::Request`, ignoring anything else (e.g. the
     /// victim's own routine, unsolicited `Digest` pushes to this address,
@@ -941,10 +985,7 @@ mod tests {
 
         let api_addr: SocketAddr = "127.0.0.1:29562".parse().unwrap();
         let node = test_node_allowing_any_rdns(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_client_api(api_addr).await;
-        });
+        spawn_client_api_task(&node, api_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1040,10 +1081,7 @@ mod tests {
             &DomainName::new("has-data-but-no-peers.binda").unwrap(),
         )
         .await;
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_gossip(gossip_addr).await;
-        });
+        spawn_gossip_task(&node, gossip_addr);
         // Long enough for several push-loop ticks; nothing to assert on
         // directly (there's no peer to send to), this just proves the
         // loop doesn't panic or block when self.peers.random_peer()
@@ -1055,10 +1093,7 @@ mod tests {
     async fn gossip_recv_loop_ignores_garbage_bytes_and_keeps_working() {
         let gossip_addr: SocketAddr = "127.0.0.1:29611".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_gossip(gossip_addr).await;
-        });
+        spawn_gossip_task(&node, gossip_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1104,10 +1139,7 @@ mod tests {
         let gossip_addr: SocketAddr = "127.0.0.1:29613".parse().unwrap();
         let node = test_node(Vec::new());
         seed_registration(&node, &DomainName::new("rate-limit-gossip.binda").unwrap()).await;
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_gossip(gossip_addr).await;
-        });
+        spawn_gossip_task(&node, gossip_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1145,10 +1177,7 @@ mod tests {
 
         let resolver_addr: SocketAddr = "127.0.0.1:29614".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_resolver(resolver_addr).await;
-        });
+        spawn_resolver_task(&node, resolver_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1182,10 +1211,7 @@ mod tests {
 
         let resolver_addr: SocketAddr = "127.0.0.1:29615".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_resolver(resolver_addr).await;
-        });
+        spawn_resolver_task(&node, resolver_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1214,10 +1240,7 @@ mod tests {
 
         let api_addr: SocketAddr = "127.0.0.1:29616".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_client_api(api_addr).await;
-        });
+        spawn_client_api_task(&node, api_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1262,10 +1285,7 @@ mod tests {
 
         let api_addr: SocketAddr = "127.0.0.1:29617".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_client_api(api_addr).await;
-        });
+        spawn_client_api_task(&node, api_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1299,10 +1319,7 @@ mod tests {
     async fn dns_rate_limiter_drops_traffic_past_the_burst() {
         let dns_addr: SocketAddr = "127.0.0.1:29618".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_dns(dns_addr).await;
-        });
+        spawn_dns_task(&node, dns_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1341,10 +1358,7 @@ mod tests {
     async fn native_dns_loop_returns_nxdomain_for_unknown_domain() {
         let dns_addr: SocketAddr = "127.0.0.1:29619".parse().unwrap();
         let node = test_node(Vec::new());
-        let n = node.clone();
-        tokio::spawn(async move {
-            let _ = n.run_dns(dns_addr).await;
-        });
+        spawn_dns_task(&node, dns_addr);
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
