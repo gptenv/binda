@@ -137,12 +137,16 @@ anti-entropy digests, and clients can probe/register/publish records over
 the client API and resolve via either BINDA's own JSON resolver protocol
 or its native DNS-shaped protocol — both fully Unicode-native, with no
 Punycode/ASCII-compatibility step anywhere in BINDA. Overall test coverage
-sits at ~94% (line/region), including real end-to-end integration tests
-for the gossip conformance-challenge protocol (a rogue peer answering
-incorrectly, a peer answering correctly, and full convergence between two
-real nodes over UDP) and local fake-server tests exercising the actual
-network code paths of NTP sync and FCrDNS verification without needing
-real internet access.
+sits at ~98% (line/region across the whole workspace, 142 + 25 = 167
+tests), including real end-to-end integration tests for the gossip
+conformance-challenge protocol (a rogue peer answering incorrectly, a
+peer answering correctly, and full convergence between two real nodes
+over UDP), local fake-server tests exercising the actual network code
+paths of NTP sync and FCrDNS verification without needing real internet
+access, and coverage of every listener's bind-failure path. `main()`
+itself is excluded from the coverage count (`#[coverage(off)]`) since
+it's pure top-level wiring around already-covered pieces and, by design,
+never returns in a real run.
 
 Still missing/simplified, in rough priority order:
 
@@ -168,9 +172,14 @@ Still missing/simplified, in rough priority order:
   (65,507 bytes), not a policy limit. Source addresses are still
   spoofable, so this doesn't stop a distributed flood; it's a first line
   of defense, not the whole story.
-- The last significant coverage gaps are `main()`'s own async
-  orchestration (spawning the four listener tasks and joining them —
-  thin glue, exercised in practice by every manual run but not under a
-  test harness) and the small fraction of `ntp`/`fcrdns` that only
-  triggers against a real, uncontrolled remote server's exact reply
-  timing rather than the local fake servers the test suite uses instead.
+- The remaining ~2% is essentially irreducible without contrived tests:
+  a handful of `node.rs` lines are the "kick off an infinite listener
+  loop" statements inside tests that intentionally never let that loop
+  finish (so the async state machine's completion path is never counted,
+  even though the loop's real behavior is thoroughly exercised via real
+  socket round-trips elsewhere in the same test); a couple of `fcrdns`/
+  `ntp` lines are a test-helper's own defensive error arm that only fires
+  if a background thread's socket read fails after the test has already
+  gotten what it needed; and a few are error variants (like a JSON
+  encode failure) that aren't reachable through this project's own types
+  without constructing a deliberately-broken value.

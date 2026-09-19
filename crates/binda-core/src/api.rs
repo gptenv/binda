@@ -151,10 +151,10 @@ mod tests {
 
         let domain = DomainName::new("example.binda").unwrap();
         let register_req = envelope_register(&signing_key, domain, 1_000);
-        match handle_client_request(&mut store, &time, register_req, true) {
-            ClientResponse::Registered { .. } => {}
-            other => panic!("expected Registered, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, register_req, true),
+            ClientResponse::Registered { .. }
+        ));
     }
 
     #[test]
@@ -164,10 +164,28 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let domain = DomainName::new("example.binda").unwrap();
         let register_req = envelope_register(&signing_key, domain, 1_000);
-        match handle_client_request(&mut store, &time, register_req, true) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
+        assert!(matches!(
+            handle_client_request(&mut store, &time, register_req, true),
+            ClientResponse::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn register_with_bad_signature_is_refused() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        handle_client_request(&mut store, &time, probe(&signing_key, 1_000), true);
+
+        let domain = DomainName::new("example.binda").unwrap();
+        let mut req = envelope_register(&signing_key, domain, 1_000);
+        if let ClientRequest::Register(envelope) = &mut req {
+            envelope.signature = vec![0u8; 64];
         }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, req, true),
+            ClientResponse::Error { .. }
+        ));
     }
 
     #[test]
@@ -189,10 +207,10 @@ mod tests {
 
         let domain = DomainName::new("example.binda").unwrap();
         let register_req = envelope_register(&signing_key, domain, 1_000);
-        match handle_client_request(&mut store, &time, register_req, false) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, register_req, false),
+            ClientResponse::Error { .. }
+        ));
     }
 
     fn probe(signing_key: &SigningKey, timestamp: u64) -> ClientRequest {
@@ -216,10 +234,10 @@ mod tests {
         if let ClientRequest::Probe(envelope) = &mut req {
             envelope.signature = vec![0u8; 64]; // wrong signature
         }
-        match handle_client_request(&mut store, &time, req, true) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, req, true),
+            ClientResponse::Error { .. }
+        ));
     }
 
     #[test]
@@ -238,15 +256,15 @@ mod tests {
             envelope_register(&owner_key, domain.clone(), 1_000),
             true,
         );
-        match handle_client_request(
-            &mut store,
-            &time,
-            envelope_register(&other_key, domain, 1_000),
-            true,
-        ) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(
+                &mut store,
+                &time,
+                envelope_register(&other_key, domain, 1_000),
+                true,
+            ),
+            ClientResponse::Error { .. }
+        ));
     }
 
     fn envelope_set_records(
@@ -309,10 +327,10 @@ mod tests {
         );
 
         let req = envelope_set_records(&stranger_key, domain, Vec::new(), 1_000);
-        match handle_client_request(&mut store, &time, req, true) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, req, true),
+            ClientResponse::Error { .. }
+        ));
     }
 
     #[test]
@@ -325,9 +343,9 @@ mod tests {
         if let ClientRequest::SetRecords(envelope) = &mut req {
             envelope.signature = vec![0u8; 64];
         }
-        match handle_client_request(&mut store, &time, req, true) {
-            ClientResponse::Error { .. } => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
+        assert!(matches!(
+            handle_client_request(&mut store, &time, req, true),
+            ClientResponse::Error { .. }
+        ));
     }
 }

@@ -395,4 +395,22 @@ mod tests {
             Err(RegistrationError::RegistrationLimitReached)
         );
     }
+
+    #[test]
+    fn a_sixth_distinct_domain_is_refused_while_still_live() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let c = client();
+        store.probe(&c, &time);
+        for i in 0..crate::liveness::MAX_REGISTRATIONS_PER_CLIENT {
+            let domain = DomainName::new(format!("d{i}.binda")).unwrap();
+            store.register(domain, &c, &time).unwrap();
+        }
+
+        let sixth = DomainName::new("one-too-many.binda").unwrap();
+        assert_eq!(
+            store.register(sixth, &c, &time),
+            Err(RegistrationError::RegistrationLimitReached)
+        );
+    }
 }

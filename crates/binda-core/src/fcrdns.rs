@@ -475,4 +475,119 @@ mod tests {
         let result = reverse_lookup("203.0.113.5".parse().unwrap(), &["127.0.0.1:1"]);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn is_forward_confirmed_false_when_reverse_lookup_itself_fails() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(!is_forward_confirmed(
+            ip,
+            "host.example.net",
+            &["127.0.0.1:1"]
+        ));
+    }
+
+    #[test]
+    fn is_forward_confirmed_false_when_forward_lookup_itself_fails() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let ptr_rdata = encode_name("host.example.net");
+        // Server only answers the one (reverse) query, so the follow-up
+        // forward lookup finds nothing listening and errors out.
+        let resolver = spawn_fake_resolver(ptr_rdata, Vec::new(), 1);
+        assert!(!is_forward_confirmed(ip, "host.example.net", &[&resolver]));
+    }
+
+    #[test]
+    fn forward_lookup_returns_aaaa_record_from_a_real_query_response() {
+        let ipv6 = std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+        // Serve the same 16-byte AAAA rdata for every query; the A query
+        // fails to parse as 4 bytes (ignored), the AAAA query succeeds.
+        let resolver = spawn_fake_resolver(Vec::new(), ipv6.octets().to_vec(), 2);
+        let ips = forward_lookup("host.example.net", &[&resolver]).unwrap();
+        assert!(ips.contains(&IpAddr::V6(ipv6)));
+    }
+
+    #[test]
+    fn encode_query_skips_an_empty_label_from_a_trailing_dot() {
+        let with_dot = encode_query(1, "example.com.", TYPE_A);
+        let without_dot = encode_query(1, "example.com", TYPE_A);
+        assert_eq!(with_dot, without_dot);
+    }
+
+    #[test]
+    fn read_name_rejects_a_compression_pointer_loop() {
+        let mut buf = vec![0u8; 12];
+        let pointer_pos = buf.len();
+        // A pointer that points at itself, so following it never
+        // terminates without the jump-count guard.
+        buf.push(0xC0 | ((pointer_pos >> 8) as u8));
+        buf.push((pointer_pos & 0xFF) as u8);
+        assert_eq!(read_name(&buf, pointer_pos), None);
+    }
+
+    #[test]
+    fn parse_response_rejects_a_too_short_message() {
+        assert_eq!(parse_response(&[0u8; 4], 1), None);
+    }
+
+    #[test]
+    fn parse_response_rejects_a_mismatched_id() {
+        let buf = vec![0u8; 48];
+        // buf's id (first two bytes) is 0, which won't match.
+        assert_eq!(parse_response(&buf, 1), None);
+    }
+
+    #[test]
+    fn query_falls_back_to_a_later_resolver_after_an_earlier_one_fails() {
+        let ptr_rdata = encode_name("host.example.net");
+        let working = spawn_fake_resolver(ptr_rdata, Vec::new(), 1);
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        // Nothing listens on the first resolver; the second is real.
+        let names = reverse_lookup(ip, &["127.0.0.1:1", &working]).unwrap();
+        assert_eq!(names, vec!["host.example.net".to_string()]);
+    }
+
+    /// A fake resolver that always answers with `fixed_rtype`, regardless
+    /// of what type was actually queried — used to exercise the "server
+    /// answered with a record type we didn't ask for" filtering path.
+    fn spawn_mismatched_type_resolver(fixed_rtype: u16, rdata: Vec<u8>) -> String {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let Ok((len, from)) = socket.recv_from(&mut buf) else {
+                return;
+            };
+            let id = &buf[0..2];
+            let question = &buf[12..len];
+            let mut response = Vec::new();
+            response.extend_from_slice(id);
+            response.extend_from_slice(&0x8180u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(question);
+            response.extend_from_slice(&[0xC0, 0x0C]);
+            response.extend_from_slice(&fixed_rtype.to_be_bytes());
+            response.extend_from_slice(&CLASS_IN.to_be_bytes());
+            response.extend_from_slice(&300u32.to_be_bytes());
+            response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            response.extend_from_slice(&rdata);
+            let _ = socket.send_to(&response, from);
+        });
+        addr
+    }
+
+    #[test]
+    fn forward_lookup_ignores_an_answer_of_the_wrong_record_type() {
+        // The server always answers with a PTR record no matter what was
+        // asked; forward_lookup wants A/AAAA, so every answer should be
+        // filtered out rather than misinterpreted.
+        let resolver = spawn_mismatched_type_resolver(TYPE_PTR, encode_name("irrelevant"));
+        let ips = forward_lookup("host.example.net", &[&resolver]).unwrap();
+        assert!(ips.is_empty());
+    }
 }
