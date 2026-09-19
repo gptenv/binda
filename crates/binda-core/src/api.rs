@@ -95,7 +95,7 @@ fn handle_register(
                         records_timestamp_millis: None,
                         records_signature: None,
                     };
-                    let _ = store.attach_rumor(rumor);
+                    let _ = store.attach_rumor(rumor, time);
                     ClientResponse::Registered { token }
                 }
                 Err(err) => ClientResponse::Error {

@@ -604,20 +604,23 @@ mod tests {
                 .to_bytes()
                 .to_vec()
         });
-        assert!(store.attach_rumor(RegistrationRumor {
-            domain: domain.clone(),
-            token,
-            client_key: client.key(),
-            owner_key: signing_key.verifying_key().to_bytes().to_vec(),
-            rdns: client.rdns.clone(),
-            registration_timestamp_millis: timestamp,
-            registration_signature: registration_signature.to_bytes().to_vec(),
-            probe_timestamp_millis: timestamp,
-            probe_signature: probe_signature.to_bytes().to_vec(),
-            records: records.clone(),
-            records_timestamp_millis: records_signature.as_ref().map(|_| timestamp),
-            records_signature,
-        }));
+        assert!(store.attach_rumor(
+            RegistrationRumor {
+                domain: domain.clone(),
+                token,
+                client_key: client.key(),
+                owner_key: signing_key.verifying_key().to_bytes().to_vec(),
+                rdns: client.rdns.clone(),
+                registration_timestamp_millis: timestamp,
+                registration_signature: registration_signature.to_bytes().to_vec(),
+                probe_timestamp_millis: timestamp,
+                probe_signature: probe_signature.to_bytes().to_vec(),
+                records: records.clone(),
+                records_timestamp_millis: records_signature.as_ref().map(|_| timestamp),
+                records_signature,
+            },
+            node.time.as_ref()
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
