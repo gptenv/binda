@@ -271,4 +271,33 @@ mod tests {
             NtpTimeSource::spawn(vec!["127.0.0.1:1".to_string()], Duration::from_secs(3600));
         assert!(!source.is_synced());
     }
+
+    #[test]
+    fn spawn_default_constructs_without_panicking() {
+        // Exercises spawn_default's own code path (forwarding
+        // DEFAULT_NTP_SERVERS/DEFAULT_POLL_INTERVAL into spawn); whether
+        // any of the real public servers actually answer depends on the
+        // environment's network access, so this only checks it returns.
+        let source = NtpTimeSource::spawn_default();
+        let _ = source.is_synced();
+    }
+
+    #[test]
+    fn query_offset_millis_errors_on_a_short_reply() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 48];
+            if let Ok((_, from)) = socket.recv_from(&mut buf) {
+                // Reply with fewer than the required 48 bytes.
+                let _ = socket.send_to(&[0u8; 10], from);
+            }
+        });
+
+        let result = query_offset_millis(&addr);
+        assert!(result.is_err());
+    }
 }

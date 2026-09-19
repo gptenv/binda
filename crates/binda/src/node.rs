@@ -497,6 +497,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_rate_limiter_maintenance_runs_without_panicking() {
+        // The maintenance task's own prune interval is long (see
+        // RATE_LIMIT_PRUNE_INTERVAL); this just confirms spawning it,
+        // and the task actually starting up, doesn't panic or block.
+        let node = test_node(Vec::new());
+        node.spawn_rate_limiter_maintenance();
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn two_nodes_converge_via_gossip() {
         let a_addr: SocketAddr = "127.0.0.1:29530".parse().unwrap();
         let b_addr: SocketAddr = "127.0.0.1:29531".parse().unwrap();

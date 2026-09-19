@@ -148,6 +148,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_lower_wins_picks_lesser_key_regardless_of_argument_order() {
+        let a = RegistrationToken {
+            issued_at_millis: 2,
+            nonce: [0; 8],
+        };
+        let b = RegistrationToken {
+            issued_at_millis: 1,
+            nonce: [0; 8],
+        };
+        // a > b here, so LowerWins must pick b even though it's the
+        // second argument.
+        assert_eq!(resolve(WinCondition::LowerWins, a, b), b);
+    }
+
+    #[test]
     fn negotiation_proposals_increment_round() {
         let mut negotiation = Negotiation::new();
         let first = negotiation.propose();
