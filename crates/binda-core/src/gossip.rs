@@ -9,7 +9,10 @@
 //!
 //! The test is not merely "did the message parse and stay within size
 //! bounds" (that's [`is_well_formed`], and it's necessary but not
-//! sufficient). Every [`GossipMessage::Request`] carries a
+//! sufficient). Gossip also enforces the request/response contract: a
+//! response may contain each requested domain at most once, and may not
+//! smuggle in an unrequested domain. Finally, every
+//! [`GossipMessage::Request`] carries a
 //! [`ConformanceChallenge`]: two synthetic registration tokens and a win
 //! condition. Real BINDA behaviour is a fully specified, deterministic
 //! function of that input (the same [`crate::collision::resolve`] every
@@ -19,6 +22,8 @@
 //! offering. Getting that answer wrong — or leaving it out — is the same
 //! signal as a malformed message: this exchange's data is dropped,
 //! unconditionally, whether or not the rumors themselves look plausible.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -108,10 +113,34 @@ pub struct DigestEntry {
 /// *for that message*.
 pub fn is_well_formed(message: &GossipMessage) -> bool {
     match message {
-        GossipMessage::Digest { rumors } => rumors.len() <= MAX_DIGEST_ENTRIES,
-        GossipMessage::Request { domains, .. } => domains.len() <= MAX_REQUEST_ENTRIES,
-        GossipMessage::Rumors { rumors, .. } => rumors.len() <= MAX_DIGEST_ENTRIES,
+        GossipMessage::Digest { rumors } => {
+            rumors.len() <= MAX_DIGEST_ENTRIES && unique_domains(rumors.iter().map(|r| &r.domain))
+        }
+        GossipMessage::Request { domains, .. } => {
+            domains.len() <= MAX_REQUEST_ENTRIES && unique_domains(domains.iter())
+        }
+        GossipMessage::Rumors { rumors, .. } => {
+            rumors.len() <= MAX_DIGEST_ENTRIES && unique_domains(rumors.iter().map(|r| &r.domain))
+        }
     }
+}
+
+/// Check the semantic part of a gossip response: a peer may answer only for
+/// domains that were requested, and at most once for each requested domain.
+/// The caller still has to authenticate the exchange with the outstanding
+/// [`ConformanceChallenge`] before applying the returned facts.
+pub fn is_valid_rumor_response(requested: &[DomainName], rumors: &[RegistrationRumor]) -> bool {
+    let requested: HashSet<&DomainName> = requested.iter().collect();
+    rumors
+        .iter()
+        .map(|rumor| &rumor.domain)
+        .all(|domain| requested.contains(domain))
+        && unique_domains(rumors.iter().map(|rumor| &rumor.domain))
+}
+
+fn unique_domains<'a>(mut domains: impl Iterator<Item = &'a DomainName>) -> bool {
+    let mut seen = HashSet::new();
+    domains.all(|domain| seen.insert(domain))
 }
 
 /// Upper bound on how many entries a single digest or rumor batch may
@@ -196,6 +225,46 @@ mod tests {
             challenge_answer: RegistrationToken::issue(0),
         };
         assert!(is_well_formed(&msg));
+    }
+
+    #[test]
+    fn duplicate_domains_are_not_well_formed() {
+        let domain = DomainName::new("example.binda").unwrap();
+        let digest = GossipMessage::Digest {
+            rumors: vec![
+                DigestEntry {
+                    domain: domain.clone(),
+                    issued_at_millis: 1,
+                },
+                DigestEntry {
+                    domain,
+                    issued_at_millis: 2,
+                },
+            ],
+        };
+        assert!(!is_well_formed(&digest));
+    }
+
+    #[test]
+    fn rumor_response_must_be_request_scoped_and_unique() {
+        let requested = vec![DomainName::new("requested.binda").unwrap()];
+        let token = RegistrationToken::issue(1);
+        let valid = vec![RegistrationRumor {
+            domain: requested[0].clone(),
+            token,
+            client_key: "client".into(),
+        }];
+        assert!(is_valid_rumor_response(&requested, &valid));
+
+        let unrequested = vec![RegistrationRumor {
+            domain: DomainName::new("unrequested.binda").unwrap(),
+            token,
+            client_key: "client".into(),
+        }];
+        assert!(!is_valid_rumor_response(&requested, &unrequested));
+
+        let duplicate = vec![valid[0].clone(), valid[0].clone()];
+        assert!(!is_valid_rumor_response(&requested, &duplicate));
     }
 
     #[test]
