@@ -91,11 +91,15 @@ pub fn reverse_lookup(ip: IpAddr, resolvers: &[&str]) -> io::Result<Vec<String>>
 }
 
 fn parse_a(data: &[u8]) -> Option<IpAddr> {
-    <[u8; 4]>::try_from(data).ok().map(|o| IpAddr::V4(Ipv4Addr::from(o)))
+    <[u8; 4]>::try_from(data)
+        .ok()
+        .map(|o| IpAddr::V4(Ipv4Addr::from(o)))
 }
 
 fn parse_aaaa(data: &[u8]) -> Option<IpAddr> {
-    <[u8; 16]>::try_from(data).ok().map(|o| IpAddr::V6(Ipv6Addr::from(o)))
+    <[u8; 16]>::try_from(data)
+        .ok()
+        .map(|o| IpAddr::V6(Ipv6Addr::from(o)))
 }
 
 type RdataParser = fn(&[u8]) -> Option<IpAddr>;
@@ -205,7 +209,10 @@ fn query(name: &str, qtype: u16, resolvers: &[&str]) -> io::Result<Vec<(u16, Vec
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, "no resolver answered"))
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "no resolver answered",
+    ))
 }
 
 fn send_and_receive(resolver: &str, request: &[u8]) -> io::Result<Vec<u8>> {
@@ -337,7 +344,9 @@ mod tests {
 
     impl RdnsVerifier for FakeVerifier {
         fn verify(&self, source_ip: IpAddr, claimed_rdns: &str) -> bool {
-            self.0.iter().any(|(ip, host)| *ip == source_ip && host == claimed_rdns)
+            self.0
+                .iter()
+                .any(|(ip, host)| *ip == source_ip && host == claimed_rdns)
         }
     }
 
@@ -347,5 +356,123 @@ mod tests {
         let verifier = FakeVerifier(vec![(ip, "host.example.net".to_string())]);
         assert!(verifier.verify(ip, "host.example.net"));
         assert!(!verifier.verify(ip, "someone-else.example.net"));
+    }
+
+    fn encode_name(name: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for label in name.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend(label.as_bytes());
+        }
+        buf.push(0);
+        buf
+    }
+
+    /// A local, in-process fake DNS server: for every query it receives,
+    /// it answers with `ptr_rdata` if the QTYPE was PTR and `a_rdata`
+    /// otherwise, using a compression pointer back to the (echoed)
+    /// question name, exactly like a real resolver's reply would. Runs
+    /// until `queries_to_serve` requests have been answered.
+    fn spawn_fake_resolver(
+        ptr_rdata: Vec<u8>,
+        a_rdata: Vec<u8>,
+        queries_to_serve: usize,
+    ) -> String {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            for _ in 0..queries_to_serve {
+                let Ok((len, from)) = socket.recv_from(&mut buf) else {
+                    return;
+                };
+                let id = &buf[0..2];
+                let question = &buf[12..len];
+                let qtype = u16::from_be_bytes([buf[len - 4], buf[len - 3]]);
+                let rdata = if qtype == TYPE_PTR {
+                    &ptr_rdata
+                } else {
+                    &a_rdata
+                };
+
+                let mut response = Vec::new();
+                response.extend_from_slice(id);
+                response.extend_from_slice(&0x8180u16.to_be_bytes());
+                response.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+                response.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+                response.extend_from_slice(&0u16.to_be_bytes());
+                response.extend_from_slice(&0u16.to_be_bytes());
+                response.extend_from_slice(question);
+                response.extend_from_slice(&[0xC0, 0x0C]); // pointer to name at offset 12
+                response.extend_from_slice(&qtype.to_be_bytes());
+                response.extend_from_slice(&CLASS_IN.to_be_bytes());
+                response.extend_from_slice(&300u32.to_be_bytes()); // TTL
+                response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+                response.extend_from_slice(rdata);
+                let _ = socket.send_to(&response, from);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn reverse_lookup_returns_ptr_name_from_a_real_query_response() {
+        let ptr_rdata = encode_name("host.example.net");
+        let resolver = spawn_fake_resolver(ptr_rdata, Vec::new(), 1);
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let names = reverse_lookup(ip, &[&resolver]).unwrap();
+        assert_eq!(names, vec!["host.example.net".to_string()]);
+    }
+
+    #[test]
+    fn forward_lookup_returns_a_record_from_a_real_query_response() {
+        let resolver = spawn_fake_resolver(Vec::new(), vec![203, 0, 113, 5], 1);
+        let ips = forward_lookup("host.example.net", &[&resolver]).unwrap();
+        assert!(ips.contains(&"203.0.113.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_forward_confirmed_true_when_both_directions_agree() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let ptr_rdata = encode_name("host.example.net");
+        let resolver = spawn_fake_resolver(ptr_rdata, vec![203, 0, 113, 5], 2);
+        assert!(is_forward_confirmed(ip, "host.example.net", &[&resolver]));
+    }
+
+    #[test]
+    fn is_forward_confirmed_false_when_ptr_does_not_match_claim() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let ptr_rdata = encode_name("someone-else.example.net");
+        let resolver = spawn_fake_resolver(ptr_rdata, vec![203, 0, 113, 5], 1);
+        assert!(!is_forward_confirmed(ip, "host.example.net", &[&resolver]));
+    }
+
+    #[test]
+    fn is_forward_confirmed_false_when_forward_lookup_disagrees() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let ptr_rdata = encode_name("host.example.net");
+        // Forward A record resolves to a different address than the
+        // request's actual source IP.
+        let resolver = spawn_fake_resolver(ptr_rdata, vec![198, 51, 100, 9], 2);
+        assert!(!is_forward_confirmed(ip, "host.example.net", &[&resolver]));
+    }
+
+    #[test]
+    fn normalize_ignores_case_and_trailing_dot() {
+        assert_eq!(
+            normalize("Host.Example.NET."),
+            normalize("host.example.net")
+        );
+    }
+
+    #[test]
+    fn unreachable_resolver_yields_error_not_panic() {
+        // Nothing is listening on this port; every call should fail
+        // cleanly rather than hang forever or panic.
+        let result = reverse_lookup("203.0.113.5".parse().unwrap(), &["127.0.0.1:1"]);
+        assert!(result.is_err());
     }
 }

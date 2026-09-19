@@ -1,5 +1,10 @@
 # binda (bind10)
 
+[![CI](https://github.com/gptenv/binda/actions/workflows/ci.yml/badge.svg)](https://github.com/gptenv/binda/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/gptenv/binda/branch/main/graph/badge.svg)](https://codecov.io/gh/gptenv/binda)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust: nightly](https://img.shields.io/badge/rust-nightly-orange.svg)](rust-toolchain.toml)
+
 > BINDA is an independent FOSS DNS resolver project. The name is derived
 > from hexadecimal notation for "bind10" and is unrelated to any
 > commercial brands. It is not affiliated with, endorsed by, or derived
@@ -37,8 +42,15 @@ within a 1-minute window.
   until they agree, and that agreed rule decides the winner.
 - **Gossip propagation** — nodes exchange registration state via
   epidemic/anti-entropy gossip. No node is marked trusted or distrusted;
-  each message is judged on whether it is well-formed BINDA protocol, and
-  malformed messages are simply ignored for that exchange.
+  every information pull bundles a small behavioural test (a
+  [`ConformanceChallenge`](crates/binda-core/src/gossip.rs) — two
+  synthetic tokens and a win condition), answerable only by actually
+  running BINDA's own deterministic collision-resolution logic, and a
+  peer's rumors are adopted only if it answers that correctly. Getting it
+  wrong, or being malformed at all, means the same thing either way: for
+  that exchange, we assume we're not talking to a real BINDA node and
+  ignore everything it sent — with no memory of the failure carried into
+  the next exchange.
 - **TOML zone files** — the same information a BIND9 zone file carries
   (SOA, records), expressed as TOML.
 
@@ -59,6 +71,21 @@ Requires Rust nightly (see `rust-toolchain.toml`).
 cargo build --workspace
 cargo test --workspace
 cargo doc --workspace --no-deps --open
+```
+
+### Test coverage
+
+Coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+and reported to [Codecov](https://codecov.io/gh/gptenv/binda) on every push
+via [`.github/workflows/coverage.yml`](.github/workflows/coverage.yml) (the
+badge above needs a `CODECOV_TOKEN` repository secret to actually upload —
+add one from codecov.io's project settings for it to go live). To check
+locally:
+
+```bash
+cargo install cargo-llvm-cov  # once
+cargo llvm-cov --workspace --summary-only   # terminal summary
+cargo llvm-cov --workspace --html --open    # browsable per-line report
 ```
 
 ## Running a node
@@ -109,7 +136,13 @@ unit-tested, and networking is wired up end-to-end: nodes gossip via UDP
 anti-entropy digests, and clients can probe/register/publish records over
 the client API and resolve via either BINDA's own JSON resolver protocol
 or its native DNS-shaped protocol — both fully Unicode-native, with no
-Punycode/ASCII-compatibility step anywhere in BINDA.
+Punycode/ASCII-compatibility step anywhere in BINDA. Overall test coverage
+sits at ~94% (line/region), including real end-to-end integration tests
+for the gossip conformance-challenge protocol (a rogue peer answering
+incorrectly, a peer answering correctly, and full convergence between two
+real nodes over UDP) and local fake-server tests exercising the actual
+network code paths of NTP sync and FCrDNS verification without needing
+real internet access.
 
 Still missing/simplified, in rough priority order:
 
@@ -135,3 +168,9 @@ Still missing/simplified, in rough priority order:
   (65,507 bytes), not a policy limit. Source addresses are still
   spoofable, so this doesn't stop a distributed flood; it's a first line
   of defense, not the whole story.
+- The last significant coverage gaps are `main()`'s own async
+  orchestration (spawning the four listener tasks and joining them —
+  thin glue, exercised in practice by every manual run but not under a
+  test harness) and the small fraction of `ntp`/`fcrdns` that only
+  triggers against a real, uncontrolled remote server's exact reply
+  timing rather than the local fake servers the test suite uses instead.

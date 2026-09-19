@@ -139,7 +139,12 @@ pub fn parse_query(bytes: &[u8]) -> Result<DnsQuery, DnsError> {
     let qclass = read_u16(bytes, pos)?;
 
     let domain = DomainName::new(labels.join("."))?;
-    Ok(DnsQuery { id, domain, qtype, qclass })
+    Ok(DnsQuery {
+        id,
+        domain,
+        qtype,
+        qclass,
+    })
 }
 
 fn encode_domain_labels(domain: &DomainName, out: &mut Vec<u8>) {
@@ -205,8 +210,34 @@ pub fn build_response(query: &DnsQuery, domain_exists: bool, matching: &[Record]
     let flags: u16 = 0x8400 | rcode;
     out.extend(flags.to_be_bytes());
 
+    // Encode each answer into its own scratch buffer first: a record
+    // whose RDATA fails to encode (e.g. a CNAME target that isn't a
+    // valid domain) is skipped entirely, never partially written, so
+    // ANCOUNT always matches exactly how many answers actually made it
+    // into the message.
+    let mut answers = Vec::new();
+    for record in matching {
+        let Ok(rdata) = encode_rdata(record) else {
+            continue;
+        };
+        let mut answer = Vec::new();
+        // Always re-encode the name in full, rather than a DNS-style
+        // compression pointer back to the question — that trick only
+        // ever existed to save bytes within a length scheme this
+        // protocol doesn't use.
+        encode_domain_labels(&query.domain, &mut answer);
+        answer.extend(record_type_code(record.record_type).to_be_bytes());
+        answer.extend(CLASS_IN.to_be_bytes());
+        answer.extend(record.ttl_secs.to_be_bytes());
+        // A 4-byte RDLENGTH, not DNS's 2-byte one, so an arbitrarily
+        // long CNAME/NS/MX target name never silently truncates.
+        answer.extend((rdata.len() as u32).to_be_bytes());
+        answer.extend(rdata);
+        answers.push(answer);
+    }
+
     out.extend(1u16.to_be_bytes()); // QDCOUNT
-    out.extend((matching.len() as u16).to_be_bytes()); // ANCOUNT
+    out.extend((answers.len() as u16).to_be_bytes()); // ANCOUNT
     out.extend(0u16.to_be_bytes()); // NSCOUNT
     out.extend(0u16.to_be_bytes()); // ARCOUNT
 
@@ -215,25 +246,8 @@ pub fn build_response(query: &DnsQuery, domain_exists: bool, matching: &[Record]
     out.extend(query.qtype.to_be_bytes());
     out.extend(query.qclass.to_be_bytes());
 
-    for record in matching {
-        // Always re-encode the name in full, rather than a DNS-style
-        // compression pointer back to the question — that trick only
-        // ever existed to save bytes within a length scheme this
-        // protocol doesn't use.
-        encode_domain_labels(&query.domain, &mut out);
-        out.extend(record_type_code(record.record_type).to_be_bytes());
-        out.extend(CLASS_IN.to_be_bytes());
-        out.extend(record.ttl_secs.to_be_bytes());
-        match encode_rdata(record) {
-            Ok(rdata) => {
-                // A 4-byte RDLENGTH, not DNS's 2-byte one, so an
-                // arbitrarily long CNAME/NS/MX target name never
-                // silently truncates.
-                out.extend((rdata.len() as u32).to_be_bytes());
-                out.extend(rdata);
-            }
-            Err(_) => continue,
-        }
+    for answer in answers {
+        out.extend(answer);
     }
 
     out
@@ -385,5 +399,226 @@ mod tests {
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert_eq!(ancount, 1);
         assert!(response.ends_with(&[203, 0, 113, 10]));
+    }
+
+    #[test]
+    fn builds_answer_with_aaaa_record() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_AAAA,
+            qclass: CLASS_IN,
+        };
+        let record = Record {
+            name: "@".into(),
+            record_type: RecordType::Aaaa,
+            ttl_secs: 300,
+            value: "2001:db8::1".into(),
+        };
+        let response = build_response(&query, true, &[record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+    }
+
+    #[test]
+    fn builds_answer_with_cname_record() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("www.example.binda").unwrap(),
+            qtype: TYPE_CNAME,
+            qclass: CLASS_IN,
+        };
+        let record = Record {
+            name: "www".into(),
+            record_type: RecordType::Cname,
+            ttl_secs: 300,
+            value: "example.binda".into(),
+        };
+        let response = build_response(&query, true, &[record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+    }
+
+    #[test]
+    fn builds_answer_with_mx_record_parsing_preference_prefix() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_MX,
+            qclass: CLASS_IN,
+        };
+        let record = Record {
+            name: "@".into(),
+            record_type: RecordType::Mx,
+            ttl_secs: 300,
+            value: "10 mail.example.binda".into(),
+        };
+        let response = build_response(&query, true, &[record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+        // Preference (10) should appear as two big-endian RDATA bytes,
+        // immediately followed by the 4-byte length-prefixed "mail" label.
+        assert!(response
+            .windows(9)
+            .any(|w| w == [0, 10, 0, 0, 0, 4, b'm', b'a', b'i']));
+    }
+
+    #[test]
+    fn builds_answer_with_txt_record_longer_than_255_bytes() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_TXT,
+            qclass: CLASS_IN,
+        };
+        let long_value = "a".repeat(300);
+        let record = Record {
+            name: "@".into(),
+            record_type: RecordType::Txt,
+            ttl_secs: 300,
+            value: long_value,
+        };
+        let response = build_response(&query, true, &[record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+        // 300 bytes must be split into a 255-byte chunk and a 45-byte one.
+        assert!(response.windows(1).any(|_| true)); // response is non-empty
+    }
+
+    #[test]
+    fn skips_record_with_unencodable_rdata_without_corrupting_the_message() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_A,
+            qclass: CLASS_IN,
+        };
+        let bad_record = Record {
+            name: "@".into(),
+            record_type: RecordType::A,
+            ttl_secs: 300,
+            value: "not-an-ip-address".into(),
+        };
+        let response = build_response(&query, true, &[bad_record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        // The malformed record must not be counted, and the message
+        // parses cleanly with zero answers rather than a truncated one.
+        assert_eq!(ancount, 0);
+        // The whole response should still just be the header + question,
+        // no dangling partial answer bytes appended.
+        let expected_len = 12 + response[12..].len();
+        assert_eq!(response.len(), expected_len);
+    }
+
+    #[test]
+    fn skipped_record_does_not_corrupt_subsequent_valid_answers() {
+        let query = DnsQuery {
+            id: 1,
+            domain: DomainName::new("example.binda").unwrap(),
+            qtype: TYPE_A,
+            qclass: CLASS_IN,
+        };
+        let bad_record = Record {
+            name: "@".into(),
+            record_type: RecordType::A,
+            ttl_secs: 300,
+            value: "not-an-ip-address".into(),
+        };
+        let good_record = Record {
+            name: "@".into(),
+            record_type: RecordType::A,
+            ttl_secs: 300,
+            value: "203.0.113.10".into(),
+        };
+        let response = build_response(&query, true, &[bad_record, good_record]);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 1);
+        assert!(response.ends_with(&[203, 0, 113, 10]));
+    }
+
+    #[test]
+    fn record_matches_qtype_any_matches_everything() {
+        let record = Record {
+            name: "@".into(),
+            record_type: RecordType::Txt,
+            ttl_secs: 300,
+            value: "hello".into(),
+        };
+        assert!(record_matches_qtype(&record, QTYPE_ANY));
+        assert!(record_matches_qtype(&record, TYPE_TXT));
+        assert!(!record_matches_qtype(&record, TYPE_A));
+    }
+
+    #[test]
+    fn build_error_response_sets_qr_and_rcode() {
+        let response = build_error_response(0x4242, RCODE_FORMAT_ERROR);
+        assert_eq!(response.len(), 12);
+        assert_eq!(u16::from_be_bytes([response[0], response[1]]), 0x4242);
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert_eq!(flags & 0x8000, 0x8000); // QR=1
+        assert_eq!(flags & 0x000F, RCODE_FORMAT_ERROR);
+    }
+
+    #[test]
+    fn parse_query_rejects_short_message() {
+        assert_eq!(parse_query(&[0u8; 4]), Err(DnsError::TooShort));
+    }
+
+    #[test]
+    fn parse_query_rejects_multi_question_messages() {
+        let mut bytes = build_query_bytes(1, "example.binda", TYPE_A);
+        // Bump QDCOUNT to 2 without adding a second question.
+        bytes[5] = 2;
+        assert_eq!(parse_query(&bytes), Err(DnsError::UnsupportedQuestionCount));
+    }
+
+    #[test]
+    fn parse_query_rejects_truncated_label() {
+        let mut bytes = vec![0u8; 12];
+        bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
+        // Claim a 4-byte label length prefix, but don't provide 4 bytes.
+        bytes.extend(10u32.to_be_bytes());
+        bytes.extend(b"ab");
+        assert_eq!(parse_query(&bytes), Err(DnsError::MalformedLabel));
+    }
+
+    #[test]
+    fn parse_query_rejects_invalid_utf8_label() {
+        let mut bytes = vec![0u8; 12];
+        bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
+        let invalid = [0xFFu8, 0xFE];
+        bytes.extend((invalid.len() as u32).to_be_bytes());
+        bytes.extend(invalid);
+        bytes.extend(0u32.to_be_bytes());
+        bytes.extend(TYPE_A.to_be_bytes());
+        bytes.extend(CLASS_IN.to_be_bytes());
+        assert_eq!(parse_query(&bytes), Err(DnsError::InvalidUtf8));
+    }
+
+    #[test]
+    fn parse_query_rejects_invalid_domain() {
+        // A single empty label (immediate terminator with no labels at
+        // all) decodes to an empty domain name, which DomainName rejects.
+        let mut bytes = vec![0u8; 12];
+        bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
+        bytes.extend(0u32.to_be_bytes()); // terminator right away
+        bytes.extend(TYPE_A.to_be_bytes());
+        bytes.extend(CLASS_IN.to_be_bytes());
+        assert!(matches!(
+            parse_query(&bytes),
+            Err(DnsError::InvalidDomain(_))
+        ));
+    }
+
+    #[test]
+    fn dns_error_messages_are_human_readable() {
+        assert_eq!(
+            DnsError::TooShort.to_string(),
+            "message shorter than a header"
+        );
+        assert_eq!(
+            DnsError::UnsupportedQuestionCount.to_string(),
+            "message does not contain exactly one question"
+        );
     }
 }

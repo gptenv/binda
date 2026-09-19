@@ -20,7 +20,9 @@ use thiserror::Error;
 /// A validated BINDA domain name (a single label or a dotted sequence of
 /// labels, exactly like a classic DNS name, but Unicode-native rather than
 /// punycode-encoded).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct DomainName(String);
 
 /// Errors that can occur while validating a candidate domain name.
@@ -127,7 +129,8 @@ mod tests {
         // Not just an RTL label next to an LTR one (already covered above)
         // but Arabic and Latin characters interleaved within a *single*
         // label, exactly as the "intermixed" requirement calls for.
-        let domain = DomainName::new("helloمرحبا🔥world").expect("intermixed bidi label should be valid");
+        let domain =
+            DomainName::new("helloمرحبا🔥world").expect("intermixed bidi label should be valid");
         assert_eq!(domain.labels().count(), 1);
         assert_eq!(domain.as_str(), "helloمرحبا🔥world");
     }
@@ -149,5 +152,63 @@ mod tests {
     fn rejects_empty_labels() {
         assert_eq!(DomainName::new("a..b"), Err(DomainNameError::EmptyLabel));
         assert_eq!(DomainName::new(".a"), Err(DomainNameError::EmptyLabel));
+    }
+
+    #[test]
+    fn rejects_trailing_empty_label() {
+        assert_eq!(DomainName::new("a."), Err(DomainNameError::EmptyLabel));
+    }
+
+    #[test]
+    fn labels_splits_on_dot_in_order() {
+        let domain = DomainName::new("a.b.c").unwrap();
+        let labels: Vec<&str> = domain.labels().collect();
+        assert_eq!(labels, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        let domain = DomainName::new("example.binda").unwrap();
+        assert_eq!(format!("{domain}"), domain.as_str());
+    }
+
+    #[test]
+    fn try_from_str_matches_new() {
+        let domain: DomainName = "example.binda".try_into().unwrap();
+        assert_eq!(domain.as_str(), "example.binda");
+
+        let err: Result<DomainName, _> = "".try_into();
+        assert_eq!(err, Err(DomainNameError::Empty));
+    }
+
+    #[test]
+    fn equal_domains_hash_and_order_consistently() {
+        use std::collections::HashSet;
+        let a = DomainName::new("example.binda").unwrap();
+        let b = DomainName::new("example.binda").unwrap();
+        let c = DomainName::new("other.binda").unwrap();
+        assert_eq!(a, b);
+        assert!(a < c || c < a);
+
+        let mut set = HashSet::new();
+        set.insert(a.clone());
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
+
+    #[test]
+    fn error_messages_are_human_readable() {
+        assert_eq!(
+            DomainNameError::Empty.to_string(),
+            "domain name must not be empty"
+        );
+        assert_eq!(
+            DomainNameError::EmptyLabel.to_string(),
+            "domain label must not be empty (found consecutive or leading/trailing '.')"
+        );
+        assert_eq!(
+            DomainNameError::NonPrintableChar { offset: 3 }.to_string(),
+            "domain name contains a non-printable character at byte offset 3"
+        );
     }
 }

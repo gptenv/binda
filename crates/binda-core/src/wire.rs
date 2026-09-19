@@ -61,8 +61,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gossip::{DigestEntry, GossipMessage};
     use crate::domain::DomainName;
+    use crate::gossip::{DigestEntry, GossipMessage};
 
     #[test]
     fn round_trips_a_gossip_message() {
@@ -75,6 +75,33 @@ mod tests {
         let bytes = encode(&msg).unwrap();
         let decoded: GossipMessage = decode(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn rejects_oversized_message_on_encode() {
+        let msg = GossipMessage::Digest {
+            rumors: vec![DigestEntry {
+                domain: DomainName::new("a".repeat(MAX_DATAGRAM_BYTES)).unwrap(),
+                issued_at_millis: 0,
+            }],
+        };
+        let result = encode(&msg);
+        assert!(matches!(result, Err(WireError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn rejects_undecodable_json() {
+        let bytes = b"{ this is not valid json";
+        let result: Result<GossipMessage, _> = decode(bytes);
+        assert!(matches!(result, Err(WireError::Decode(_))));
+    }
+
+    #[test]
+    fn error_messages_are_human_readable() {
+        let huge = vec![0u8; MAX_DATAGRAM_BYTES + 1];
+        let result: Result<GossipMessage, _> = decode(&huge);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
     }
 
     #[test]

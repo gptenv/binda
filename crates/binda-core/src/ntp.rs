@@ -124,16 +124,23 @@ fn query_offset_millis(server: &str) -> io::Result<i64> {
     let mut packet = [0u8; 48];
     packet[0] = 0b00_100_011; // LI=0 (no warning), VN=4, Mode=3 (client)
 
-    let t1 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t1 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     write_ntp_timestamp(&mut packet[40..48], t1);
 
     socket.send(&packet)?;
     let mut reply = [0u8; 48];
     let n = socket.recv(&mut reply)?;
     if n < 48 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short NTP reply"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short NTP reply",
+        ));
     }
-    let t4 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t4 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
 
     // Receive Timestamp (T2): when the server received our request.
     let t2 = read_ntp_timestamp(&reply[32..40]);
@@ -193,5 +200,75 @@ mod tests {
             .as_millis() as u64;
         let reported = source.now_millis();
         assert!(reported.abs_diff(local) < 1000);
+    }
+
+    /// A local, in-process fake SNTP server: answers the one request it
+    /// receives claiming to be `offset_millis` ahead of (or behind, if
+    /// negative) this machine's real clock.
+    fn spawn_fake_ntp_server(offset_millis: i64) -> String {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 48];
+            let Ok((_, from)) = socket.recv_from(&mut buf) else {
+                return;
+            };
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let server_time = if offset_millis >= 0 {
+                now + Duration::from_millis(offset_millis as u64)
+            } else {
+                now - Duration::from_millis((-offset_millis) as u64)
+            };
+            let mut reply = [0u8; 48];
+            reply[0] = 0b00_100_100; // LI=0, VN=4, Mode=4 (server)
+            write_ntp_timestamp(&mut reply[32..40], server_time); // Receive Timestamp
+            write_ntp_timestamp(&mut reply[40..48], server_time); // Transmit Timestamp
+            let _ = socket.send_to(&reply, from);
+        });
+        addr
+    }
+
+    #[test]
+    fn query_offset_millis_reflects_server_clock_difference() {
+        let server = spawn_fake_ntp_server(5_000);
+        let offset = query_offset_millis(&server).unwrap();
+        // Generous tolerance for test scheduling jitter.
+        assert!((offset - 5_000).abs() < 1_000, "offset was {offset}");
+    }
+
+    #[test]
+    fn query_offset_millis_handles_negative_offset() {
+        let server = spawn_fake_ntp_server(-3_000);
+        let offset = query_offset_millis(&server).unwrap();
+        assert!((offset + 3_000).abs() < 1_000, "offset was {offset}");
+    }
+
+    #[test]
+    fn query_offset_millis_errors_when_resolver_unreachable() {
+        assert!(query_offset_millis("127.0.0.1:1").is_err());
+    }
+
+    #[test]
+    fn ntp_time_source_applies_offset_and_reports_synced() {
+        let server = spawn_fake_ntp_server(10_000);
+        let source = NtpTimeSource::spawn(vec![server], Duration::from_secs(3600));
+        assert!(source.is_synced());
+
+        let local = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let reported = source.now_millis() as i64;
+        assert!((reported - (local + 10_000)).abs() < 2_000);
+    }
+
+    #[test]
+    fn ntp_time_source_stays_unsynced_when_every_server_is_unreachable() {
+        let source =
+            NtpTimeSource::spawn(vec!["127.0.0.1:1".to_string()], Duration::from_secs(3600));
+        assert!(!source.is_synced());
     }
 }

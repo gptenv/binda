@@ -25,7 +25,9 @@ pub fn handle_client_request(
     let now = time.now_millis();
     match request {
         ClientRequest::Probe(envelope) => handle_probe(store, time, now, envelope),
-        ClientRequest::Register(envelope) => handle_register(store, time, now, envelope, rdns_verified),
+        ClientRequest::Register(envelope) => {
+            handle_register(store, time, now, envelope, rdns_verified)
+        }
         ClientRequest::SetRecords(envelope) => handle_set_records(store, now, envelope),
     }
 }
@@ -81,7 +83,11 @@ fn handle_set_records(
     now: u64,
     envelope: SignedEnvelope<SetRecordsBody>,
 ) -> ClientResponse {
-    let message = set_records_message(&envelope.body.domain, &envelope.body.records, envelope.timestamp_millis);
+    let message = set_records_message(
+        &envelope.body.domain,
+        &envelope.body.records,
+        envelope.timestamp_millis,
+    );
     match authenticate(&envelope, &message, now) {
         Ok(identity) => {
             if store.set_records(&envelope.body.domain, &identity, envelope.body.records) {
@@ -107,7 +113,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
-    fn envelope_register(signing_key: &SigningKey, domain: DomainName, timestamp: u64) -> ClientRequest {
+    fn envelope_register(
+        signing_key: &SigningKey,
+        domain: DomainName,
+        timestamp: u64,
+    ) -> ClientRequest {
         let message = register_message(&domain, timestamp);
         let signature = signing_key.sign(&message);
         ClientRequest::Register(SignedEnvelope {
@@ -180,6 +190,142 @@ mod tests {
         let domain = DomainName::new("example.binda").unwrap();
         let register_req = envelope_register(&signing_key, domain, 1_000);
         match handle_client_request(&mut store, &time, register_req, false) {
+            ClientResponse::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn probe(signing_key: &SigningKey, timestamp: u64) -> ClientRequest {
+        let msg = crate::client_api::probe_message(timestamp);
+        let sig = signing_key.sign(&msg);
+        ClientRequest::Probe(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: "host.example.net".into(),
+            timestamp_millis: timestamp,
+            signature: sig.to_bytes().to_vec(),
+            body: ProbeBody,
+        })
+    }
+
+    #[test]
+    fn probe_with_bad_signature_is_refused() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut req = probe(&signing_key, 1_000);
+        if let ClientRequest::Probe(envelope) = &mut req {
+            envelope.signature = vec![0u8; 64]; // wrong signature
+        }
+        match handle_client_request(&mut store, &time, req, true) {
+            ClientResponse::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registering_an_already_taken_domain_is_refused() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let owner_key = SigningKey::generate(&mut OsRng);
+        let other_key = SigningKey::generate(&mut OsRng);
+        handle_client_request(&mut store, &time, probe(&owner_key, 1_000), true);
+        handle_client_request(&mut store, &time, probe(&other_key, 1_000), true);
+
+        let domain = DomainName::new("example.binda").unwrap();
+        handle_client_request(
+            &mut store,
+            &time,
+            envelope_register(&owner_key, domain.clone(), 1_000),
+            true,
+        );
+        match handle_client_request(
+            &mut store,
+            &time,
+            envelope_register(&other_key, domain, 1_000),
+            true,
+        ) {
+            ClientResponse::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn envelope_set_records(
+        signing_key: &SigningKey,
+        domain: DomainName,
+        records: Vec<crate::zone::Record>,
+        timestamp: u64,
+    ) -> ClientRequest {
+        let message = crate::client_api::set_records_message(&domain, &records, timestamp);
+        let signature = signing_key.sign(&message);
+        ClientRequest::SetRecords(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: "host.example.net".into(),
+            timestamp_millis: timestamp,
+            signature: signature.to_bytes().to_vec(),
+            body: crate::client_api::SetRecordsBody { domain, records },
+        })
+    }
+
+    #[test]
+    fn set_records_succeeds_for_domain_owner() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        handle_client_request(&mut store, &time, probe(&signing_key, 1_000), true);
+        let domain = DomainName::new("example.binda").unwrap();
+        handle_client_request(
+            &mut store,
+            &time,
+            envelope_register(&signing_key, domain.clone(), 1_000),
+            true,
+        );
+
+        let records = vec![crate::zone::Record {
+            name: "@".into(),
+            record_type: crate::zone::RecordType::A,
+            ttl_secs: 300,
+            value: "203.0.113.1".into(),
+        }];
+        let req = envelope_set_records(&signing_key, domain, records, 1_000);
+        assert_eq!(
+            handle_client_request(&mut store, &time, req, true),
+            ClientResponse::RecordsSet
+        );
+    }
+
+    #[test]
+    fn set_records_fails_for_non_owner() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let owner_key = SigningKey::generate(&mut OsRng);
+        let stranger_key = SigningKey::generate(&mut OsRng);
+        handle_client_request(&mut store, &time, probe(&owner_key, 1_000), true);
+        let domain = DomainName::new("example.binda").unwrap();
+        handle_client_request(
+            &mut store,
+            &time,
+            envelope_register(&owner_key, domain.clone(), 1_000),
+            true,
+        );
+
+        let req = envelope_set_records(&stranger_key, domain, Vec::new(), 1_000);
+        match handle_client_request(&mut store, &time, req, true) {
+            ClientResponse::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_records_with_bad_signature_is_refused() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let domain = DomainName::new("example.binda").unwrap();
+        let mut req = envelope_set_records(&signing_key, domain, Vec::new(), 1_000);
+        if let ClientRequest::SetRecords(envelope) = &mut req {
+            envelope.signature = vec![0u8; 64];
+        }
+        match handle_client_request(&mut store, &time, req, true) {
             ClientResponse::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
         }

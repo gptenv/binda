@@ -120,7 +120,12 @@ impl RegistryStore {
 
     /// Attach zone records to a domain this node's own client already
     /// owns. Fails silently (no-op) if `client` does not hold `domain`.
-    pub fn set_records(&mut self, domain: &DomainName, client: &ClientIdentity, records: Vec<Record>) -> bool {
+    pub fn set_records(
+        &mut self,
+        domain: &DomainName,
+        client: &ClientIdentity,
+        records: Vec<Record>,
+    ) -> bool {
         match self.registrations.get_mut(domain) {
             Some(reg) if reg.client_key == client.key() => {
                 reg.records = records;
@@ -136,7 +141,12 @@ impl RegistryStore {
     /// issues locally. If the domain is already held here under a
     /// different claim, the two claims are arbitrated via the same mutual
     /// coin-negotiation protocol used for a live collision.
-    pub fn adopt_rumor(&mut self, domain: DomainName, client_key: String, token: RegistrationToken) {
+    pub fn adopt_rumor(
+        &mut self,
+        domain: DomainName,
+        client_key: String,
+        token: RegistrationToken,
+    ) {
         match self.registrations.get(&domain) {
             None => {
                 self.registrations.insert(
@@ -171,14 +181,23 @@ impl RegistryStore {
 
     /// Release every registration belonging to clients who have missed
     /// their liveness window.
+    ///
+    /// This also forgets those clients' registration counts, not just
+    /// their domains: without that, a client that later comes back live
+    /// would find its slot count still pinned at whatever it was before
+    /// going stale, even though none of its old domains still exist to
+    /// justify that count.
     pub fn reclaim_stale(&mut self, time: &dyn TimeSource) {
-        let expired: std::collections::HashSet<String> =
-            self.liveness.expired_clients(time).into_iter().collect();
+        let expired = self.liveness.expired_clients(time);
         if expired.is_empty() {
             return;
         }
+        let expired: std::collections::HashSet<String> = expired.into_iter().collect();
         self.registrations
             .retain(|_, reg| !expired.contains(&reg.client_key));
+        for key in &expired {
+            self.liveness.forget_client_by_key(key);
+        }
     }
 
     /// Look up the current registration for `domain`, if any.
@@ -215,7 +234,10 @@ mod tests {
         let mut store = RegistryStore::new();
         let c = client();
         let domain = DomainName::new("example.binda").unwrap();
-        assert_eq!(store.register(domain, &c, &time), Err(RegistrationError::NotLive));
+        assert_eq!(
+            store.register(domain, &c, &time),
+            Err(RegistrationError::NotLive)
+        );
     }
 
     #[test]
@@ -227,8 +249,150 @@ mod tests {
         let domain = DomainName::new("example.binda").unwrap();
         store.register(domain.clone(), &c, &time).unwrap();
 
-        time.advance(std::time::Duration::from_millis(crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1));
+        time.advance(std::time::Duration::from_millis(
+            crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1,
+        ));
         store.reclaim_stale(&time);
         assert!(store.lookup(&domain).is_none());
+    }
+
+    #[test]
+    fn client_can_reach_the_cap_again_after_going_stale_and_coming_back() {
+        // Regression test: reclaim_stale used to remove a stale client's
+        // domains but leave its registration count untouched, which
+        // would permanently pin it at the cap even after every one of
+        // its old domains had already been freed.
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let c = client();
+        store.probe(&c, &time);
+        for i in 0..crate::liveness::MAX_REGISTRATIONS_PER_CLIENT {
+            let domain = DomainName::new(format!("d{i}.binda")).unwrap();
+            store.register(domain, &c, &time).unwrap();
+        }
+
+        time.advance(std::time::Duration::from_millis(
+            crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 1,
+        ));
+        store.reclaim_stale(&time);
+
+        // Client comes back live and should be able to register a full
+        // batch again, not be stuck at the old count.
+        store.probe(&c, &time);
+        let domain = DomainName::new("fresh.binda").unwrap();
+        assert!(store.register(domain, &c, &time).is_ok());
+    }
+
+    #[test]
+    fn adopt_rumor_inserts_when_domain_unknown() {
+        let mut store = RegistryStore::new();
+        let domain = DomainName::new("example.binda").unwrap();
+        let token = RegistrationToken::issue(1000);
+        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
+        let reg = store.lookup(&domain).unwrap();
+        assert_eq!(reg.client_key, "someone");
+        assert_eq!(reg.token, token);
+    }
+
+    #[test]
+    fn adopt_rumor_is_a_no_op_when_already_known() {
+        let mut store = RegistryStore::new();
+        let domain = DomainName::new("example.binda").unwrap();
+        let token = RegistrationToken::issue(1000);
+        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
+        // Same client_key and token again: nothing should change.
+        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
+        let reg = store.lookup(&domain).unwrap();
+        assert_eq!(reg.client_key, "someone");
+        assert_eq!(reg.token, token);
+    }
+
+    #[test]
+    fn adopt_rumor_resolves_collision_when_claims_differ() {
+        let mut store = RegistryStore::new();
+        let domain = DomainName::new("example.binda").unwrap();
+        let token_a = RegistrationToken::issue(1000);
+        let token_b = RegistrationToken::issue(2000);
+        store.adopt_rumor(domain.clone(), "a".to_string(), token_a);
+        store.adopt_rumor(domain.clone(), "b".to_string(), token_b);
+        let reg = store.lookup(&domain).unwrap();
+        assert!(reg.client_key == "a" || reg.client_key == "b");
+    }
+
+    #[test]
+    fn set_records_fails_for_non_owner() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let owner = client();
+        let stranger = client();
+        store.probe(&owner, &time);
+        let domain = DomainName::new("example.binda").unwrap();
+        store.register(domain.clone(), &owner, &time).unwrap();
+
+        assert!(!store.set_records(&domain, &stranger, Vec::new()));
+    }
+
+    #[test]
+    fn set_records_fails_for_unregistered_domain() {
+        let mut store = RegistryStore::new();
+        let c = client();
+        let domain = DomainName::new("example.binda").unwrap();
+        assert!(!store.set_records(&domain, &c, Vec::new()));
+    }
+
+    #[test]
+    fn set_records_succeeds_for_owner() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let c = client();
+        store.probe(&c, &time);
+        let domain = DomainName::new("example.binda").unwrap();
+        store.register(domain.clone(), &c, &time).unwrap();
+
+        let records = vec![crate::zone::Record {
+            name: "@".into(),
+            record_type: crate::zone::RecordType::A,
+            ttl_secs: 300,
+            value: "203.0.113.1".into(),
+        }];
+        assert!(store.set_records(&domain, &c, records.clone()));
+        assert_eq!(store.lookup(&domain).unwrap().records, records);
+    }
+
+    #[test]
+    fn all_rumors_reflects_every_registration() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let c = client();
+        store.probe(&c, &time);
+        let d1 = DomainName::new("one.binda").unwrap();
+        let d2 = DomainName::new("two.binda").unwrap();
+        store.register(d1.clone(), &c, &time).unwrap();
+        store.register(d2.clone(), &c, &time).unwrap();
+
+        let domains: std::collections::HashSet<_> = store
+            .all_rumors()
+            .map(|(domain, _, _)| domain.clone())
+            .collect();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&d1));
+        assert!(domains.contains(&d2));
+    }
+
+    #[test]
+    fn registering_an_already_held_live_domain_is_refused() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let owner = client();
+        let other = client();
+        store.probe(&owner, &time);
+        store.probe(&other, &time);
+        let domain = DomainName::new("example.binda").unwrap();
+        store.register(domain.clone(), &owner, &time).unwrap();
+
+        assert_eq!(
+            store.register(domain, &other, &time),
+            Err(RegistrationError::RegistrationLimitReached)
+        );
     }
 }

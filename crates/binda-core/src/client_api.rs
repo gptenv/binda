@@ -93,7 +93,11 @@ pub fn register_message(domain: &DomainName, timestamp_millis: u64) -> Vec<u8> {
 
 /// Build the canonical byte message a `SetRecords` request's signature
 /// covers.
-pub fn set_records_message(domain: &DomainName, records: &[Record], timestamp_millis: u64) -> Vec<u8> {
+pub fn set_records_message(
+    domain: &DomainName,
+    records: &[Record],
+    timestamp_millis: u64,
+) -> Vec<u8> {
     let mut msg = format!("binda-set-records:{domain}:{timestamp_millis}:").into_bytes();
     if let Ok(json) = serde_json::to_vec(records) {
         msg.extend(json);
@@ -165,7 +169,10 @@ mod tests {
             body: ProbeBody,
         };
         let far_future = 1000 + REQUEST_FRESHNESS_WINDOW_MILLIS + 1;
-        assert_eq!(authenticate(&envelope, &msg, far_future), Err(RequestAuthError::Stale));
+        assert_eq!(
+            authenticate(&envelope, &msg, far_future),
+            Err(RequestAuthError::Stale)
+        );
     }
 
     #[test]
@@ -185,5 +192,74 @@ mod tests {
             authenticate(&envelope, &msg, 1000),
             Err(RequestAuthError::Signature(_))
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_key_length() {
+        let msg = probe_message(1000);
+        let envelope = SignedEnvelope {
+            verifying_key: vec![1, 2, 3], // not 32 bytes
+            rdns: "host.example.net".into(),
+            timestamp_millis: 1000,
+            signature: vec![0u8; 64],
+            body: ProbeBody,
+        };
+        assert_eq!(
+            authenticate(&envelope, &msg, 1000),
+            Err(RequestAuthError::MalformedKey)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_signature_length() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let msg = probe_message(1000);
+        let envelope = SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: "host.example.net".into(),
+            timestamp_millis: 1000,
+            signature: vec![1, 2, 3], // not 64 bytes
+            body: ProbeBody,
+        };
+        assert_eq!(
+            authenticate(&envelope, &msg, 1000),
+            Err(RequestAuthError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn is_fresh_boundary_conditions() {
+        assert!(is_fresh(1000, 1000));
+        assert!(is_fresh(1000, 1000 + REQUEST_FRESHNESS_WINDOW_MILLIS));
+        assert!(!is_fresh(1000, 1000 + REQUEST_FRESHNESS_WINDOW_MILLIS + 1));
+        assert!(is_fresh(1000 + REQUEST_FRESHNESS_WINDOW_MILLIS, 1000));
+        assert!(!is_fresh(1000 + REQUEST_FRESHNESS_WINDOW_MILLIS + 1, 1000));
+    }
+
+    #[test]
+    fn set_records_message_includes_records_json() {
+        use crate::zone::{Record, RecordType};
+        let domain = DomainName::new("example.binda").unwrap();
+        let records = vec![Record {
+            name: "@".into(),
+            record_type: RecordType::A,
+            ttl_secs: 300,
+            value: "203.0.113.1".into(),
+        }];
+        let msg = set_records_message(&domain, &records, 1000);
+        let msg_str = String::from_utf8(msg).unwrap();
+        assert!(msg_str.contains("203.0.113.1"));
+        assert!(msg_str.starts_with("binda-set-records:example.binda:1000:"));
+    }
+
+    #[test]
+    fn different_messages_produce_different_canonical_bytes() {
+        let domain_a = DomainName::new("a.binda").unwrap();
+        let domain_b = DomainName::new("b.binda").unwrap();
+        assert_ne!(
+            register_message(&domain_a, 1000),
+            register_message(&domain_b, 1000)
+        );
+        assert_ne!(probe_message(1000), probe_message(2000));
     }
 }
