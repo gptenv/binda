@@ -744,8 +744,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn correctly_challenged_but_request_invalid_rumors_are_rejected() {
-        let victim_addr: SocketAddr = "127.0.0.1:29560".parse().unwrap();
-        let rogue_addr: SocketAddr = "127.0.0.1:29561".parse().unwrap();
+        let victim_addr: SocketAddr = "127.0.0.1:29580".parse().unwrap();
+        let rogue_addr: SocketAddr = "127.0.0.1:29581".parse().unwrap();
         let requested = DomainName::new("requested.binda").unwrap();
         let unrequested = DomainName::new("unrequested.binda").unwrap();
 
