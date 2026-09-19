@@ -1,15 +1,16 @@
 //! The running node: owns the registration store and drives the gossip
 //! and resolver UDP loops.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use binda_core::api::handle_client_request;
 use binda_core::client_api::ClientRequest;
 use binda_core::dns;
 use binda_core::fcrdns::{self, RdnsVerifier};
-use binda_core::gossip::{is_well_formed, DigestEntry, GossipMessage, RegistrationRumor};
+use binda_core::gossip::{is_well_formed, ConformanceChallenge, DigestEntry, GossipMessage, RegistrationRumor};
 use binda_core::liveness::TimeSource;
 use binda_core::ntp::NtpTimeSource;
 use binda_core::rate_limit::RateLimiter;
@@ -48,6 +49,15 @@ fn new_rate_limiter() -> Mutex<RateLimiter<SocketAddr>> {
     ))
 }
 
+/// How long an outstanding [`ConformanceChallenge`] this node issued is
+/// kept waiting for its answer before being dropped as abandoned.
+const PENDING_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on outstanding challenges tracked at once, mirroring the rate
+/// limiters' own bound: a flood of `Digest` messages from spoofed source
+/// addresses (each provoking us to issue a fresh challenge) can't grow
+/// this map without bound.
+const MAX_PENDING_CHALLENGES: usize = 10_000;
+
 /// Shared node state, cheap to clone (everything behind `Arc`).
 #[derive(Clone)]
 pub struct Node {
@@ -58,6 +68,11 @@ pub struct Node {
     resolver_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
     api_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
     dns_limiter: Arc<Mutex<RateLimiter<SocketAddr>>>,
+    /// Conformance challenges this node has issued (via a
+    /// [`GossipMessage::Request`]) and is waiting to see answered
+    /// correctly in the matching [`GossipMessage::Rumors`] reply, keyed
+    /// by the peer address the request was sent to.
+    pending_challenges: Arc<Mutex<HashMap<SocketAddr, (ConformanceChallenge, Instant)>>>,
 }
 
 impl Node {
@@ -75,6 +90,7 @@ impl Node {
             resolver_limiter: Arc::new(new_rate_limiter()),
             api_limiter: Arc::new(new_rate_limiter()),
             dns_limiter: Arc::new(new_rate_limiter()),
+            pending_challenges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -89,14 +105,19 @@ impl Node {
             self.api_limiter.clone(),
             self.dns_limiter.clone(),
         ];
+        let pending_challenges = self.pending_challenges.clone();
         tokio::spawn(async move {
             let mut ticker = interval(RATE_LIMIT_PRUNE_INTERVAL);
             loop {
                 ticker.tick().await;
-                let now = std::time::Instant::now();
+                let now = Instant::now();
                 for limiter in &limiters {
                     limiter.lock().await.prune_older_than(RATE_LIMIT_PRUNE_AGE, now);
                 }
+                pending_challenges
+                    .lock()
+                    .await
+                    .retain(|_, (_, issued_at)| now.duration_since(*issued_at) < PENDING_CHALLENGE_TIMEOUT);
             }
         });
     }
@@ -180,12 +201,33 @@ impl Node {
                 if missing.is_empty() {
                     return;
                 }
-                let request = GossipMessage::Request { domains: missing };
+
+                // Bundle a fresh behavioural test with the request: real
+                // BINDA behaviour is a deterministic function of this
+                // challenge (crate::collision::resolve), so a peer that
+                // can't answer it correctly isn't proven to run BINDA's
+                // protocol logic, whatever its rumors claim.
+                let challenge = ConformanceChallenge::random(self.time.now_millis());
+                {
+                    let mut pending = self.pending_challenges.lock().await;
+                    if !pending.contains_key(&from) && pending.len() >= MAX_PENDING_CHALLENGES {
+                        if let Some(oldest) = pending
+                            .iter()
+                            .min_by_key(|(_, (_, issued_at))| *issued_at)
+                            .map(|(addr, _)| *addr)
+                        {
+                            pending.remove(&oldest);
+                        }
+                    }
+                    pending.insert(from, (challenge, Instant::now()));
+                }
+
+                let request = GossipMessage::Request { domains: missing, challenge };
                 if let Ok(bytes) = wire::encode(&request) {
                     let _ = socket.send_to(&bytes, from).await;
                 }
             }
-            GossipMessage::Request { domains } => {
+            GossipMessage::Request { domains, challenge } => {
                 let rumors: Vec<RegistrationRumor> = {
                     let store = self.store.lock().await;
                     domains
@@ -199,15 +241,39 @@ impl Node {
                         })
                         .collect()
                 };
-                if rumors.is_empty() {
-                    return;
-                }
-                let response = GossipMessage::Rumors { rumors };
+                // Always answer the challenge, even with zero rumors:
+                // proving correct behaviour doesn't depend on having data
+                // to share, and silently dropping an empty-but-correct
+                // answer would just make legitimate peers with nothing
+                // new look indistinguishable from incorrect ones.
+                let response = GossipMessage::Rumors {
+                    rumors,
+                    challenge_answer: challenge.expected_answer(),
+                };
                 if let Ok(bytes) = wire::encode(&response) {
                     let _ = socket.send_to(&bytes, from).await;
                 }
             }
-            GossipMessage::Rumors { rumors } => {
+            GossipMessage::Rumors { rumors, challenge_answer } => {
+                let expected = {
+                    let mut pending = self.pending_challenges.lock().await;
+                    pending.remove(&from)
+                };
+                let Some((challenge, _)) = expected else {
+                    // No outstanding challenge for this address: either
+                    // we never asked, or it already timed out. Either
+                    // way, there's nothing to verify this answer against,
+                    // so it isn't trusted.
+                    return;
+                };
+                if challenge_answer != challenge.expected_answer() {
+                    // Wrong answer to a fully deterministic function of
+                    // our own challenge: for this exchange, we assume
+                    // we're not actually talking to a BINDA node, and
+                    // ignore everything it sent, rumors included.
+                    return;
+                }
+
                 let mut store = self.store.lock().await;
                 for rumor in rumors {
                     store.adopt_rumor(rumor.domain, rumor.client_key, rumor.token);

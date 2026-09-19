@@ -37,8 +37,15 @@ within a 1-minute window.
   until they agree, and that agreed rule decides the winner.
 - **Gossip propagation** — nodes exchange registration state via
   epidemic/anti-entropy gossip. No node is marked trusted or distrusted;
-  each message is judged on whether it is well-formed BINDA protocol, and
-  malformed messages are simply ignored for that exchange.
+  every information pull bundles a small behavioural test (a
+  [`ConformanceChallenge`](crates/binda-core/src/gossip.rs) — two
+  synthetic tokens and a win condition), answerable only by actually
+  running BINDA's own deterministic collision-resolution logic, and a
+  peer's rumors are adopted only if it answers that correctly. Getting it
+  wrong, or being malformed at all, means the same thing either way: for
+  that exchange, we assume we're not talking to a real BINDA node and
+  ignore everything it sent — with no memory of the failure carried into
+  the next exchange.
 - **TOML zone files** — the same information a BIND9 zone file carries
   (SOA, records), expressed as TOML.
 
