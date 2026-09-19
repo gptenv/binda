@@ -46,11 +46,12 @@ within a 1-minute window.
   [`ConformanceChallenge`](crates/binda-core/src/gossip.rs) — two
   synthetic tokens and a win condition), answerable only by actually
   running BINDA's own deterministic collision-resolution logic, and a
-  peer's rumors are adopted only if it answers that correctly. Getting it
-  wrong, or being malformed at all, means the same thing either way: for
-  that exchange, we assume we're not talking to a real BINDA node and
-  ignore everything it sent — with no memory of the failure carried into
-  the next exchange.
+  peer's rumors are adopted only if it answers that correctly and obeys the
+  request/response contract (no duplicates and no unrequested domains).
+  Getting any of that wrong, or being malformed at all, means the same
+  thing either way: for that exchange, we assume we're not talking to a
+  real BINDA node and ignore everything it sent — with no memory of the
+  failure carried into the next exchange.
 - **TOML zone files** — the same information a BIND9 zone file carries
   (SOA, records), expressed as TOML.
 

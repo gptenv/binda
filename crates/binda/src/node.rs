@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 use binda_core::api::handle_client_request;
 use binda_core::client_api::ClientRequest;
 use binda_core::dns;
+use binda_core::domain::DomainName;
 use binda_core::fcrdns::{self, RdnsVerifier};
 use binda_core::gossip::{
-    is_well_formed, ConformanceChallenge, DigestEntry, GossipMessage, RegistrationRumor,
+    is_valid_rumor_response, is_well_formed, ConformanceChallenge, DigestEntry, GossipMessage,
+    RegistrationRumor,
 };
 use binda_core::liveness::TimeSource;
 use binda_core::ntp::NtpTimeSource;
@@ -60,6 +62,8 @@ const PENDING_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// this map without bound.
 const MAX_PENDING_CHALLENGES: usize = 10_000;
 
+type PendingChallenge = (ConformanceChallenge, Vec<DomainName>, Instant);
+
 /// Shared node state, cheap to clone (everything behind `Arc`).
 #[derive(Clone)]
 pub struct Node {
@@ -74,7 +78,7 @@ pub struct Node {
     /// [`GossipMessage::Request`]) and is waiting to see answered
     /// correctly in the matching [`GossipMessage::Rumors`] reply, keyed
     /// by the peer address the request was sent to.
-    pending_challenges: Arc<Mutex<HashMap<SocketAddr, (ConformanceChallenge, Instant)>>>,
+    pending_challenges: Arc<Mutex<HashMap<SocketAddr, PendingChallenge>>>,
     /// What checks a `Register` request's claimed `rdns` hostname against
     /// its actual source address. Real deployments must use the default
     /// ([`fcrdns::FcrdnsVerifier`]); swapping in
@@ -140,9 +144,12 @@ impl Node {
                         .await
                         .prune_older_than(RATE_LIMIT_PRUNE_AGE, now);
                 }
-                pending_challenges.lock().await.retain(|_, (_, issued_at)| {
-                    now.duration_since(*issued_at) < PENDING_CHALLENGE_TIMEOUT
-                });
+                pending_challenges
+                    .lock()
+                    .await
+                    .retain(|_, (_, _, issued_at)| {
+                        now.duration_since(*issued_at) < PENDING_CHALLENGE_TIMEOUT
+                    });
             }
         });
     }
@@ -247,13 +254,13 @@ impl Node {
                     if !pending.contains_key(&from) && pending.len() >= MAX_PENDING_CHALLENGES {
                         if let Some(oldest) = pending
                             .iter()
-                            .min_by_key(|(_, (_, issued_at))| *issued_at)
+                            .min_by_key(|(_, (_, _, issued_at))| *issued_at)
                             .map(|(addr, _)| *addr)
                         {
                             pending.remove(&oldest);
                         }
                     }
-                    pending.insert(from, (challenge, Instant::now()));
+                    pending.insert(from, (challenge, missing.clone(), Instant::now()));
                 }
 
                 let request = GossipMessage::Request {
@@ -299,7 +306,7 @@ impl Node {
                     let mut pending = self.pending_challenges.lock().await;
                     pending.remove(&from)
                 };
-                let Some((challenge, _)) = expected else {
+                let Some((challenge, requested, _)) = expected else {
                     // No outstanding challenge for this address: either
                     // we never asked, or it already timed out. Either
                     // way, there's nothing to verify this answer against,
@@ -311,6 +318,14 @@ impl Node {
                     // our own challenge: for this exchange, we assume
                     // we're not actually talking to a BINDA node, and
                     // ignore everything it sent, rumors included.
+                    return;
+                }
+
+                if !is_valid_rumor_response(&requested, &rumors) {
+                    // A correctly answered challenge proves only that the
+                    // sender can perform the deterministic BINDA operation.
+                    // It does not excuse violating the request/response
+                    // contract: never adopt an unrequested or duplicate fact.
                     return;
                 }
 
@@ -455,6 +470,7 @@ mod tests {
     use binda_core::client::ClientIdentity;
     use binda_core::domain::DomainName;
     use binda_core::liveness::SystemTimeSource;
+    use binda_core::token::RegistrationToken;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::time::Duration as StdDuration;
@@ -728,6 +744,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn correctly_challenged_but_request_invalid_rumors_are_rejected() {
+        let victim_addr: SocketAddr = "127.0.0.1:29580".parse().unwrap();
+        let rogue_addr: SocketAddr = "127.0.0.1:29581".parse().unwrap();
+        let requested = DomainName::new("requested.binda").unwrap();
+        let unrequested = DomainName::new("unrequested.binda").unwrap();
+
+        let victim = test_node(vec![rogue_addr]);
+        spawn_gossip_task(&victim, victim_addr);
+        let rogue_socket = UdpSocket::bind(rogue_addr).await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        rogue_socket
+            .send_to(
+                &wire::encode(&GossipMessage::Digest {
+                    rumors: vec![DigestEntry {
+                        domain: requested.clone(),
+                        issued_at_millis: u64::MAX,
+                    }],
+                })
+                .unwrap(),
+                victim_addr,
+            )
+            .await
+            .unwrap();
+        let (_, challenge, from) = recv_request(&rogue_socket).await;
+        let invalid_response = GossipMessage::Rumors {
+            rumors: vec![RegistrationRumor {
+                domain: unrequested.clone(),
+                token: binda_core::token::RegistrationToken::issue(0),
+                client_key: "rogue".into(),
+            }],
+            challenge_answer: challenge.expected_answer(),
+        };
+        rogue_socket
+            .send_to(&wire::encode(&invalid_response).unwrap(), from)
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+        let store = victim.store.lock().await;
+        assert!(store.lookup(&requested).is_none());
+        assert!(store.lookup(&unrequested).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resolver_returns_registered_owner_and_records() {
         use binda_core::resolver::{ResolveAnswer, ResolveQuery};
         use binda_core::zone::{Record, RecordType};
@@ -864,6 +925,10 @@ mod tests {
         client_socket
             .set_read_timeout(Some(StdDuration::from_secs(3)))
             .unwrap();
+        // With no complete message ID there is no error response that can be
+        // addressed back to the sender; the listener must simply continue.
+        client_socket.send_to(&[0x99], dns_addr).unwrap();
+        std::thread::sleep(StdDuration::from_millis(50));
         // A 2-byte message can't possibly be a valid query, but it does
         // carry a recognizable ID for the error response to echo.
         client_socket.send_to(&[0x99, 0x88], dns_addr).unwrap();
@@ -1054,12 +1119,15 @@ mod tests {
             let mut pending = node.pending_challenges.lock().await;
             pending.insert(
                 fresh_peer,
-                (ConformanceChallenge::random(0), Instant::now()),
+                (ConformanceChallenge::random(0), Vec::new(), Instant::now()),
             );
             let long_ago = Instant::now()
                 .checked_sub(PENDING_CHALLENGE_TIMEOUT + Duration::from_secs(1))
                 .expect("test process has been up long enough for this");
-            pending.insert(stale_peer, (ConformanceChallenge::random(0), long_ago));
+            pending.insert(
+                stale_peer,
+                (ConformanceChallenge::random(0), Vec::new(), long_ago),
+            );
         }
 
         node.spawn_rate_limiter_maintenance();
@@ -1070,6 +1138,55 @@ mod tests {
         let pending = node.pending_challenges.lock().await;
         assert!(pending.contains_key(&fresh_peer));
         assert!(!pending.contains_key(&stale_peer));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_challenge_table_evicts_oldest_peer_at_capacity() {
+        let node = test_node(Vec::new());
+        let oldest_peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let newest_peer: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let incoming_peer: SocketAddr = "127.0.0.1:20000".parse().unwrap();
+        {
+            let mut pending = node.pending_challenges.lock().await;
+            for port in 1..=MAX_PENDING_CHALLENGES as u16 {
+                pending.insert(
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    (
+                        ConformanceChallenge::random(port as u64),
+                        Vec::new(),
+                        Instant::now(),
+                    ),
+                );
+            }
+            // Make the ordering deterministic without waiting for the
+            // timeout-based maintenance task.
+            let oldest = pending.get_mut(&oldest_peer).unwrap();
+            oldest.2 = Instant::now()
+                .checked_sub(PENDING_CHALLENGE_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+            let newest = pending.get_mut(&newest_peer).unwrap();
+            newest.2 = Instant::now();
+        }
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let domain = DomainName::new("capacity-eviction.binda").unwrap();
+        node.handle_gossip_message(
+            &socket,
+            incoming_peer,
+            GossipMessage::Digest {
+                rumors: vec![DigestEntry {
+                    domain,
+                    issued_at_millis: u64::MAX,
+                }],
+            },
+        )
+        .await;
+
+        let pending = node.pending_challenges.lock().await;
+        assert_eq!(pending.len(), MAX_PENDING_CHALLENGES);
+        assert!(!pending.contains_key(&oldest_peer));
+        assert!(pending.contains_key(&newest_peer));
+        assert!(pending.contains_key(&incoming_peer));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1102,6 +1219,37 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        // A decodable message with duplicate domains is also invalid at the
+        // protocol layer. The listener must drop it and continue serving the
+        // next valid exchange.
+        let duplicate_domain = DomainName::new("duplicate.binda").unwrap();
+        let duplicate_digest = GossipMessage::Digest {
+            rumors: vec![
+                DigestEntry {
+                    domain: duplicate_domain.clone(),
+                    issued_at_millis: 1,
+                },
+                DigestEntry {
+                    domain: duplicate_domain,
+                    issued_at_millis: 2,
+                },
+            ],
+        };
+        socket
+            .send_to(&wire::encode(&duplicate_digest).unwrap(), gossip_addr)
+            .await
+            .unwrap();
+
+        // A rumor without an outstanding request must likewise be ignored.
+        let unsolicited = GossipMessage::Rumors {
+            rumors: Vec::new(),
+            challenge_answer: RegistrationToken::issue(0),
+        };
+        socket
+            .send_to(&wire::encode(&unsolicited).unwrap(), gossip_addr)
+            .await
+            .unwrap();
 
         // The loop must have survived the garbage: a well-formed message
         // sent right after should still get a real reply.
