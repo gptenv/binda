@@ -50,4 +50,28 @@ mod tests {
         let b = RegistrationToken::issue(1000);
         assert_ne!(a.nonce, b.nonce);
     }
+
+    #[test]
+    fn raw_ordering_key_encodes_timestamp_then_nonce_big_endian() {
+        let token = RegistrationToken {
+            issued_at_millis: 0x0102030405060708,
+            nonce: [0xAA; 8],
+        };
+        let key = token.raw_ordering_key();
+        assert_eq!(&key[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&key[8..], &[0xAA; 8]);
+    }
+
+    #[test]
+    fn later_timestamp_sorts_higher_in_ordering_key() {
+        let earlier = RegistrationToken {
+            issued_at_millis: 1,
+            nonce: [0xFF; 8],
+        };
+        let later = RegistrationToken {
+            issued_at_millis: 2,
+            nonce: [0; 8],
+        };
+        assert!(later.raw_ordering_key() > earlier.raw_ordering_key());
+    }
 }

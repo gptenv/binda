@@ -78,6 +78,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_message_on_encode() {
+        let msg = GossipMessage::Digest {
+            rumors: vec![DigestEntry {
+                domain: DomainName::new("a".repeat(MAX_DATAGRAM_BYTES)).unwrap(),
+                issued_at_millis: 0,
+            }],
+        };
+        let result = encode(&msg);
+        assert!(matches!(result, Err(WireError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn rejects_undecodable_json() {
+        let bytes = b"{ this is not valid json";
+        let result: Result<GossipMessage, _> = decode(bytes);
+        assert!(matches!(result, Err(WireError::Decode(_))));
+    }
+
+    #[test]
+    fn error_messages_are_human_readable() {
+        let huge = vec![0u8; MAX_DATAGRAM_BYTES + 1];
+        let result: Result<GossipMessage, _> = decode(&huge);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
     fn rejects_oversized_input() {
         let huge = vec![0u8; MAX_DATAGRAM_BYTES + 1];
         let result: Result<GossipMessage, _> = decode(&huge);

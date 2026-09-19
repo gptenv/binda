@@ -110,4 +110,40 @@ mod tests {
         let parsed = ZoneFile::from_toml(&toml_str).unwrap();
         assert_eq!(zone, parsed);
     }
+
+    #[test]
+    fn defaults_records_to_empty_when_omitted() {
+        let toml_str = r#"
+            [soa]
+            primary_nameserver = "ns1.example.binda"
+            admin_email = "admin.example.binda"
+            serial = 1
+            refresh_secs = 3600
+            retry_secs = 600
+            expire_secs = 604800
+            minimum_ttl_secs = 300
+        "#;
+        let zone = ZoneFile::from_toml(toml_str).unwrap();
+        assert!(zone.records.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        let result = ZoneFile::from_toml("this is not valid toml {{{");
+        assert!(matches!(result, Err(ZoneFileError::Parse(_))));
+    }
+
+    #[test]
+    fn rejects_missing_required_field() {
+        let result = ZoneFile::from_toml("[soa]\nprimary_nameserver = \"ns1.example.binda\"");
+        assert!(matches!(result, Err(ZoneFileError::Parse(_))));
+    }
+
+    #[test]
+    fn error_messages_are_human_readable() {
+        let err = ZoneFile::from_toml("not toml {{{").unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("failed to parse TOML zone file"));
+    }
 }

@@ -133,6 +133,17 @@ impl LivenessTracker {
         self.registration_counts.remove(&client.key());
     }
 
+    /// Fully forget a client identified by its raw key (as returned by
+    /// [`Self::expired_clients`]): both its registration count and its
+    /// last-seen timestamp. Without this, a client that goes stale and
+    /// comes back later would find its old registration count still on
+    /// the books — permanently stuck at the cap even though every domain
+    /// it used to hold was already reclaimed.
+    pub fn forget_client_by_key(&mut self, key: &str) {
+        self.registration_counts.remove(key);
+        self.last_seen_millis.remove(key);
+    }
+
     /// Every client identity key that has missed its liveness window as of
     /// `time`, i.e. whose held domains should now be released.
     pub fn expired_clients(&self, time: &dyn TimeSource) -> Vec<String> {
@@ -188,5 +199,70 @@ mod tests {
             tracker.increment_registration(&c);
         }
         assert!(!tracker.can_register(&c, &time));
+    }
+
+    #[test]
+    fn never_probed_client_is_not_live() {
+        let time = MockTimeSource::new(0);
+        let tracker = LivenessTracker::new();
+        let c = client();
+        assert!(!tracker.is_live(&c, &time));
+        assert!(!tracker.can_register(&c, &time));
+    }
+
+    #[test]
+    fn registration_count_starts_at_zero() {
+        let tracker = LivenessTracker::new();
+        assert_eq!(tracker.registration_count(&client()), 0);
+    }
+
+    #[test]
+    fn clear_registrations_resets_count() {
+        let time = MockTimeSource::new(0);
+        let mut tracker = LivenessTracker::new();
+        let c = client();
+        tracker.record_probe(&c, &time);
+        tracker.increment_registration(&c);
+        assert_eq!(tracker.registration_count(&c), 1);
+        tracker.clear_registrations(&c);
+        assert_eq!(tracker.registration_count(&c), 0);
+    }
+
+    #[test]
+    fn forget_client_by_key_clears_both_count_and_liveness() {
+        let time = MockTimeSource::new(0);
+        let mut tracker = LivenessTracker::new();
+        let c = client();
+        tracker.record_probe(&c, &time);
+        tracker.increment_registration(&c);
+
+        tracker.forget_client_by_key(&c.key());
+
+        assert_eq!(tracker.registration_count(&c), 0);
+        assert!(!tracker.is_live(&c, &time));
+    }
+
+    #[test]
+    fn expired_clients_lists_only_stale_ones() {
+        let time = MockTimeSource::new(0);
+        let mut tracker = LivenessTracker::new();
+        let stale = client();
+        let fresh = client();
+        tracker.record_probe(&stale, &time);
+        time.advance(Duration::from_millis(
+            LIVENESS_WINDOW.as_millis() as u64 + 1,
+        ));
+        tracker.record_probe(&fresh, &time);
+
+        let expired = tracker.expired_clients(&time);
+        assert_eq!(expired, vec![stale.key()]);
+    }
+
+    #[test]
+    fn system_time_source_reports_plausible_unix_time() {
+        let source = SystemTimeSource;
+        // Any time after this file was written; guards against an
+        // obviously-broken clock read (e.g. returning 0).
+        assert!(source.now_millis() > 1_700_000_000_000);
     }
 }

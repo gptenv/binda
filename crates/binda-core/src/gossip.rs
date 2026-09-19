@@ -149,6 +149,56 @@ mod tests {
     }
 
     #[test]
+    fn oversized_request_is_rejected() {
+        let domains = (0..MAX_REQUEST_ENTRIES + 1)
+            .map(|i| DomainName::new(format!("d{i}.binda")).unwrap())
+            .collect();
+        let msg = GossipMessage::Request {
+            domains,
+            challenge: ConformanceChallenge::random(0),
+        };
+        assert!(!is_well_formed(&msg));
+    }
+
+    #[test]
+    fn normal_request_is_accepted() {
+        let msg = GossipMessage::Request {
+            domains: vec![DomainName::new("example.binda").unwrap()],
+            challenge: ConformanceChallenge::random(0),
+        };
+        assert!(is_well_formed(&msg));
+    }
+
+    #[test]
+    fn oversized_rumors_is_rejected() {
+        let rumors = (0..MAX_DIGEST_ENTRIES + 1)
+            .map(|i| RegistrationRumor {
+                domain: DomainName::new(format!("d{i}.binda")).unwrap(),
+                token: RegistrationToken::issue(0),
+                client_key: "someone".to_string(),
+            })
+            .collect();
+        let msg = GossipMessage::Rumors {
+            rumors,
+            challenge_answer: RegistrationToken::issue(0),
+        };
+        assert!(!is_well_formed(&msg));
+    }
+
+    #[test]
+    fn normal_rumors_is_accepted() {
+        let msg = GossipMessage::Rumors {
+            rumors: vec![RegistrationRumor {
+                domain: DomainName::new("example.binda").unwrap(),
+                token: RegistrationToken::issue(0),
+                client_key: "someone".to_string(),
+            }],
+            challenge_answer: RegistrationToken::issue(0),
+        };
+        assert!(is_well_formed(&msg));
+    }
+
+    #[test]
     fn conformance_challenge_has_exactly_one_correct_answer() {
         let challenge = ConformanceChallenge::random(1_000);
         let answer = challenge.expected_answer();
