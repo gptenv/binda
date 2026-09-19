@@ -1,0 +1,53 @@
+//! Registration tokens: the timestamp + random nonce pair issued to a
+//! client when it registers a domain, used to detect and order collisions.
+
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+
+/// A unique-enough claim on a domain name: the issuing time plus 8
+/// cryptographically random bytes.
+///
+/// Two clients racing to register the same name will each be issued a
+/// distinct token; if a collision is detected (two live tokens for the
+/// same [`crate::domain::DomainName`]), the tokens are handed to
+/// [`crate::collision::resolve`] to pick a winner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationToken {
+    pub issued_at_millis: u64,
+    pub nonce: [u8; 8],
+}
+
+impl RegistrationToken {
+    /// Issue a fresh token for the given timestamp, drawing its nonce from
+    /// a cryptographically secure RNG.
+    pub fn issue(issued_at_millis: u64) -> Self {
+        let mut nonce = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        Self {
+            issued_at_millis,
+            nonce,
+        }
+    }
+
+    /// Deterministically compare two tokens' raw bytes, high-to-low. Used
+    /// as the tie-break input to the coin-negotiation collision protocol,
+    /// never as the sole decision rule (see [`crate::collision`]).
+    pub fn raw_ordering_key(&self) -> [u8; 16] {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&self.issued_at_millis.to_be_bytes());
+        key[8..].copy_from_slice(&self.nonce);
+        key
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_are_distinct() {
+        let a = RegistrationToken::issue(1000);
+        let b = RegistrationToken::issue(1000);
+        assert_ne!(a.nonce, b.nonce);
+    }
+}
