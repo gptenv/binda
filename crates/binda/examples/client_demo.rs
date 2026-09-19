@@ -3,18 +3,24 @@
 //! resolver protocol and via BINDA's native DNS-shaped wire protocol
 //! (which carries the label as raw UTF-8 — no Punycode involved).
 //!
-//! Note: the `rdns` claimed below (`client-demo.example.net`) almost
-//! certainly won't forward-confirm against wherever you actually run
-//! this from (see `binda_core::fcrdns`), so `register` is expected to
-//! come back as an `Error` unless you edit `rdns` to a hostname that
-//! genuinely resolves back to your machine's real source IP.
-//!
-//! Run a node first, then this example against it:
+//! The `rdns` claimed below (`client-demo.example.net`) is made up and
+//! won't forward-confirm against wherever you actually run this from
+//! (see `binda_core::fcrdns`) — that check needs a real, reverse-DNS-
+//! delegated host, which a laptop or CI runner doesn't have. To see the
+//! full flow succeed locally, start the node with
+//! `--insecure-skip-rdns-verification` (see
+//! [`binda_core::fcrdns::AllowAllVerifier`] for exactly what that turns
+//! off, and why it must never be used on a node anyone else can reach):
 //!
 //! ```bash
-//! cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 &
+//! cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 --insecure-skip-rdns-verification &
 //! cargo run -p binda --example client_demo
 //! ```
+//!
+//! Run it *without* that flag instead if you want to see the FCrDNS
+//! check do its job and correctly refuse the made-up `rdns` — `register`
+//! will come back as an `Error` in that case, which is expected, not a
+//! bug.
 
 use std::net::UdpSocket;
 use std::time::{SystemTime, UNIX_EPOCH};

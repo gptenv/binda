@@ -111,6 +111,13 @@ binda --gossip 0.0.0.0:9530 --resolver 0.0.0.0:9531 --api 0.0.0.0:9532 \
 - `--peer` — a known peer's gossip address; repeatable. Peers also learn
   about each other dynamically from inbound gossip, so only one bootstrap
   peer per new node is typically needed.
+- `--insecure-skip-rdns-verification` — accept every claimed `rdns`
+  hostname without checking it (see
+  [`fcrdns::AllowAllVerifier`](crates/binda-core/src/fcrdns.rs)). This is
+  for running a node locally, for demos and manual testing, where no
+  claimed hostname could ever genuinely forward-confirm. **Never pass
+  this on a node anyone else can reach** — it turns the "5 domains per
+  live socket" cap back into "5 domains per free keypair."
 
 A node's clock is disciplined against public NTP servers
 ([`ntp::NtpTimeSource`](crates/binda-core/src/ntp.rs)) rather than trusting
@@ -121,10 +128,13 @@ See [`examples/client_demo.rs`](crates/binda/examples/client_demo.rs) for
 a full walkthrough of a client: probe liveness, register a Unicode
 domain, publish an A record, then resolve it both via BINDA's own
 resolver protocol and via BINDA's native, DNS-shaped protocol — proving
-the label crosses the wire as raw UTF-8, not Punycode.
+the label crosses the wire as raw UTF-8, not Punycode. The node below is
+started with `--insecure-skip-rdns-verification` so the demo's made-up
+`rdns` claim is accepted and `register` actually succeeds; drop that flag
+to see the real FCrDNS check correctly refuse it instead.
 
 ```bash
-cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 &
+cargo run -p binda --bin binda -- --gossip 127.0.0.1:9530 --resolver 127.0.0.1:9531 --api 127.0.0.1:9532 --dns 127.0.0.1:9533 --insecure-skip-rdns-verification &
 cargo run -p binda --example client_demo
 ```
 

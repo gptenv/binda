@@ -15,6 +15,15 @@
 //! protocol, not RFC 1035; a production deployment might still bind it to
 //! port 53 as a convenient, familiar-looking address, which needs
 //! elevated privilege on most systems).
+//!
+//! `--insecure-skip-rdns-verification` disables the FCrDNS check a
+//! `Register` request's claimed `rdns` normally has to pass (see
+//! [`binda_core::fcrdns`]). It exists so a node can be run locally — on
+//! a laptop, behind NAT, with no real reverse-DNS delegation — for
+//! demos and manual testing, where no claimed hostname could ever
+//! genuinely forward-confirm. **Never pass this flag on a node anyone
+//! else can reach**: it turns the "5 domains per live socket" cap back
+//! into "5 domains per free keypair."
 
 // `main` itself is excluded from coverage accounting (see the attribute
 // on it below): it's pure top-level wiring — parse args, construct a
@@ -40,6 +49,7 @@ struct Args {
     api_addr: SocketAddr,
     dns_addr: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
+    insecure_skip_rdns_verification: bool,
 }
 
 fn parse_args() -> Args {
@@ -55,6 +65,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut api_addr: SocketAddr = "0.0.0.0:9532".parse().unwrap();
     let mut dns_addr: Option<SocketAddr> = None;
     let mut peers = Vec::new();
+    let mut insecure_skip_rdns_verification = false;
 
     let mut args = args;
     while let Some(flag) = args.next() {
@@ -96,6 +107,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .expect("invalid --peer address");
                 peers.push(addr);
             }
+            "--insecure-skip-rdns-verification" => {
+                insecure_skip_rdns_verification = true;
+            }
             other => {
                 eprintln!("binda: ignoring unrecognized argument {other}");
             }
@@ -108,6 +122,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         api_addr,
         dns_addr,
         peers,
+        insecure_skip_rdns_verification,
     }
 }
 
@@ -171,7 +186,16 @@ async fn main() -> std::io::Result<()> {
     let args = parse_args();
     println!("binda (bind10) — starting node");
 
-    let node = Node::new(args.peers.clone());
+    let node = if args.insecure_skip_rdns_verification {
+        eprintln!(
+            "binda: WARNING — running with --insecure-skip-rdns-verification: \
+             every claimed rdns hostname is accepted unchecked. Never run a \
+             node reachable by anyone else this way."
+        );
+        Node::new_allowing_any_rdns(args.peers.clone())
+    } else {
+        Node::new(args.peers.clone())
+    };
     node.spawn_rate_limiter_maintenance();
     println!(
         "binda: known peers at startup: {:?}",
@@ -203,6 +227,13 @@ mod tests {
         assert_eq!(parsed.api_addr, "0.0.0.0:9532".parse().unwrap());
         assert_eq!(parsed.dns_addr, None);
         assert!(parsed.peers.is_empty());
+        assert!(!parsed.insecure_skip_rdns_verification);
+    }
+
+    #[test]
+    fn insecure_skip_rdns_verification_flag_is_recognized() {
+        let parsed = args(&["--insecure-skip-rdns-verification"]);
+        assert!(parsed.insecure_skip_rdns_verification);
     }
 
     #[test]
@@ -273,6 +304,7 @@ mod tests {
             api_addr: "127.0.0.1:29592".parse().unwrap(),
             dns_addr: Some("127.0.0.1:29593".parse().unwrap()),
             peers: Vec::new(),
+            insecure_skip_rdns_verification: false,
         };
         let tasks = spawn_listener_tasks(&node, &parsed_args);
         assert!(tasks.dns.is_some());
@@ -291,6 +323,7 @@ mod tests {
             api_addr: "127.0.0.1:29596".parse().unwrap(),
             dns_addr: None,
             peers: Vec::new(),
+            insecure_skip_rdns_verification: false,
         };
         let tasks = spawn_listener_tasks(&node, &parsed_args);
         assert!(tasks.dns.is_none());
@@ -321,6 +354,7 @@ mod tests {
             api_addr,
             dns_addr: Some(dns_addr),
             peers: Vec::new(),
+            insecure_skip_rdns_verification: false,
         };
         let tasks = spawn_listener_tasks(&node, &parsed_args);
 

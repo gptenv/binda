@@ -75,14 +75,34 @@ pub struct Node {
     /// correctly in the matching [`GossipMessage::Rumors`] reply, keyed
     /// by the peer address the request was sent to.
     pending_challenges: Arc<Mutex<HashMap<SocketAddr, (ConformanceChallenge, Instant)>>>,
+    /// What checks a `Register` request's claimed `rdns` hostname against
+    /// its actual source address. Real deployments must use the default
+    /// ([`fcrdns::FcrdnsVerifier`]); swapping in
+    /// [`fcrdns::AllowAllVerifier`] (via
+    /// [`Node::new_allowing_any_rdns`]) is for local demos and testing
+    /// only, and is never the default.
+    rdns_verifier: Arc<dyn RdnsVerifier>,
 }
 
 impl Node {
     /// Construct a node whose clock is disciplined against public NTP
-    /// servers. This blocks briefly (bounded by the per-server query
-    /// timeout) to get an initial offset before the node starts trusting
-    /// it for liveness decisions.
+    /// servers, and whose registrations are gated by real FCrDNS
+    /// verification. This blocks briefly (bounded by the per-server
+    /// query timeout) to get an initial NTP offset before the node
+    /// starts trusting it for liveness decisions.
     pub fn new(peers: Vec<SocketAddr>) -> Self {
+        Self::new_with_verifier(peers, Arc::new(fcrdns::FcrdnsVerifier))
+    }
+
+    /// Construct a node that accepts *any* claimed `rdns` hostname
+    /// without checking it — see [`fcrdns::AllowAllVerifier`] for why
+    /// this only ever belongs in a local demo or test, never a real
+    /// deployment reachable by anyone else.
+    pub fn new_allowing_any_rdns(peers: Vec<SocketAddr>) -> Self {
+        Self::new_with_verifier(peers, Arc::new(fcrdns::AllowAllVerifier))
+    }
+
+    fn new_with_verifier(peers: Vec<SocketAddr>, rdns_verifier: Arc<dyn RdnsVerifier>) -> Self {
         let time: Arc<dyn TimeSource> = Arc::new(NtpTimeSource::spawn_default());
         Self {
             store: Arc::new(Mutex::new(RegistryStore::new())),
@@ -93,6 +113,7 @@ impl Node {
             api_limiter: Arc::new(new_rate_limiter()),
             dns_limiter: Arc::new(new_rate_limiter()),
             pending_challenges: Arc::new(Mutex::new(HashMap::new())),
+            rdns_verifier,
         }
     }
 
@@ -351,19 +372,19 @@ impl Node {
             };
 
             // Only a Register actually needs this (it's what the "5
-            // domains per live socket" cap gates), and it's a real,
-            // blocking network round-trip against the public DNS system,
-            // so it runs off the async runtime's worker threads and
-            // (crucially) before the store's lock is ever taken.
+            // domains per live socket" cap gates), and (with the real
+            // FcrdnsVerifier) it's a blocking network round-trip against
+            // the public DNS system, so it runs off the async runtime's
+            // worker threads and (crucially) before the store's lock is
+            // ever taken.
             let rdns_verified = match &request {
                 ClientRequest::Register(envelope) => {
                     let source_ip = from.ip();
                     let claimed_rdns = envelope.rdns.clone();
-                    tokio::task::spawn_blocking(move || {
-                        fcrdns::FcrdnsVerifier.verify(source_ip, &claimed_rdns)
-                    })
-                    .await
-                    .unwrap_or(false)
+                    let verifier = self.rdns_verifier.clone();
+                    tokio::task::spawn_blocking(move || verifier.verify(source_ip, &claimed_rdns))
+                        .await
+                        .unwrap_or(false)
                 }
                 _ => true,
             };
@@ -451,6 +472,19 @@ mod tests {
             api_limiter: Arc::new(new_rate_limiter()),
             dns_limiter: Arc::new(new_rate_limiter()),
             pending_challenges: Arc::new(Mutex::new(HashMap::new())),
+            rdns_verifier: Arc::new(fcrdns::FcrdnsVerifier),
+        }
+    }
+
+    /// Same as [`test_node`], but with FCrDNS verification switched off,
+    /// so `Register` requests succeed without needing real reverse-DNS
+    /// infrastructure. Used only to test the `Register` happy path
+    /// itself; every other test uses the real verifier so a wrongly
+    /// "always succeeds" verifier can't mask a real regression.
+    fn test_node_allowing_any_rdns(peers: Vec<SocketAddr>) -> Node {
+        Node {
+            rdns_verifier: Arc::new(fcrdns::AllowAllVerifier),
+            ..test_node(peers)
         }
     }
 
@@ -895,5 +929,64 @@ mod tests {
             ClientResponse::Error { .. } => {}
             other => panic!("expected Error (no real host can forward-confirm this made-up rdns), got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_via_client_api_succeeds_with_rdns_verification_disabled() {
+        use binda_core::client_api::{
+            probe_message, register_message, ClientRequest, ClientResponse, ProbeBody,
+            RegisterBody, SignedEnvelope,
+        };
+        use ed25519_dalek::Signer;
+
+        let api_addr: SocketAddr = "127.0.0.1:29562".parse().unwrap();
+        let node = test_node_allowing_any_rdns(Vec::new());
+        let n = node.clone();
+        tokio::spawn(async move {
+            let _ = n.run_client_api(api_addr).await;
+        });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_socket
+            .set_read_timeout(Some(StdDuration::from_secs(3)))
+            .unwrap();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let rdns = "this-would-never-forward-confirm.invalid".to_string();
+
+        let t = node.time.now_millis();
+        let probe_msg = probe_message(t);
+        let probe_sig = signing_key.sign(&probe_msg);
+        let probe_req = ClientRequest::Probe(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns: rdns.clone(),
+            timestamp_millis: t,
+            signature: probe_sig.to_bytes().to_vec(),
+            body: ProbeBody,
+        });
+        client_socket
+            .send_to(&wire::encode(&probe_req).unwrap(), api_addr)
+            .unwrap();
+        let mut buf = vec![0u8; wire::MAX_DATAGRAM_BYTES];
+        let (len, _) = client_socket.recv_from(&mut buf).unwrap();
+        let _: ClientResponse = wire::decode(&buf[..len]).unwrap();
+
+        let domain = DomainName::new("demo-succeeds.binda").unwrap();
+        let t = node.time.now_millis();
+        let register_msg = register_message(&domain, t);
+        let register_sig = signing_key.sign(&register_msg);
+        let register_req = ClientRequest::Register(SignedEnvelope {
+            verifying_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns,
+            timestamp_millis: t,
+            signature: register_sig.to_bytes().to_vec(),
+            body: RegisterBody { domain },
+        });
+        client_socket
+            .send_to(&wire::encode(&register_req).unwrap(), api_addr)
+            .unwrap();
+        let (len, _) = client_socket.recv_from(&mut buf).unwrap();
+        let response: ClientResponse = wire::decode(&buf[..len]).unwrap();
+        assert!(matches!(response, ClientResponse::Registered { .. }));
     }
 }
