@@ -17,6 +17,8 @@ use crate::zone::Record;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub client_key: String,
+    /// Canonical FCrDNS host that consumed this registration slot.
+    pub quota_key: String,
     pub token: RegistrationToken,
     pub records: Vec<Record>,
     pub rumor: Option<RegistrationRumor>,
@@ -27,7 +29,7 @@ pub struct Registration {
 pub enum RegistrationError {
     #[error("client is not currently live (must probe within the liveness window first)")]
     NotLive,
-    #[error("client already holds the maximum number of registrations")]
+    #[error("verified host already holds the maximum number of registrations")]
     RegistrationLimitReached,
 }
 
@@ -107,6 +109,7 @@ impl RegistryStore {
             domain,
             Registration {
                 client_key: client.key(),
+                quota_key: client.quota_key(),
                 token,
                 records: Vec::new(),
                 rumor: None,
@@ -123,15 +126,16 @@ impl RegistryStore {
     pub fn resolve_collision(
         &mut self,
         domain: DomainName,
-        a: (String, RegistrationToken),
-        b: (String, RegistrationToken),
+        a: (String, String, RegistrationToken),
+        b: (String, String, RegistrationToken),
     ) {
-        let winner_token = negotiate_locally(a.1, b.1);
-        let (client_key, token) = if winner_token == a.1 { a } else { b };
+        let winner_token = negotiate_locally(a.2, b.2);
+        let (client_key, quota_key, token) = if winner_token == a.2 { a } else { b };
         self.registrations.insert(
             domain,
             Registration {
                 client_key,
+                quota_key,
                 token,
                 records: Vec::new(),
                 rumor: None,
@@ -224,6 +228,7 @@ impl RegistryStore {
                     domain,
                     Registration {
                         client_key,
+                        quota_key: rumor.rdns.trim().trim_end_matches('.').to_ascii_lowercase(),
                         token,
                         records: rumor.records.clone(),
                         rumor: Some(rumor),
@@ -243,6 +248,7 @@ impl RegistryStore {
                         domain,
                         Registration {
                             client_key,
+                            quota_key: rumor.rdns.trim().trim_end_matches('.').to_ascii_lowercase(),
                             token,
                             records: rumor.records.clone(),
                             rumor: Some(rumor),
@@ -277,7 +283,7 @@ impl RegistryStore {
         }
         let expired: std::collections::HashSet<String> = expired.into_iter().collect();
         self.registrations
-            .retain(|_, reg| !expired.contains(&reg.client_key));
+            .retain(|_, reg| !expired.contains(&reg.quota_key));
         for key in &expired {
             self.liveness.forget_client_by_key(key);
         }
@@ -309,6 +315,33 @@ mod tests {
         store.probe(&c, &time);
         let domain = DomainName::new("example.binda").unwrap();
         assert!(store.register(domain, &c, &time).is_ok());
+    }
+
+    #[test]
+    fn rotating_owner_keys_does_not_reset_a_verified_hosts_quota() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let first = client();
+        let replacement = client();
+        assert_eq!(first.quota_key(), replacement.quota_key());
+        assert_ne!(first.key(), replacement.key());
+        store.probe(&first, &time);
+        for i in 0..crate::liveness::MAX_REGISTRATIONS_PER_CLIENT {
+            store
+                .register(
+                    DomainName::new(format!("first-{i}.binda")).unwrap(),
+                    &first,
+                    &time,
+                )
+                .unwrap();
+        }
+        // A probe signed by a replacement key keeps the same reachable
+        // host live, but must not manufacture another five slots.
+        store.probe(&replacement, &time);
+        assert_eq!(
+            store.register(DomainName::new("sixth.binda").unwrap(), &replacement, &time),
+            Err(RegistrationError::RegistrationLimitReached)
+        );
     }
 
     #[test]

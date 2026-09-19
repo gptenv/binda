@@ -20,9 +20,10 @@ within a 1-minute window.
   respond to a liveness probe within a minute; miss the window and it
   falls back into the pool. (Originally a stricter 3 seconds; relaxed to
   give room for ordinary reconfiguration downtime.)
-- **Squatting resistance** — a maximum of 5 live registrations per client,
-  where a client is identified by an Ed25519 signature combined with its
-  reverse-DNS hostname. That hostname isn't just asserted: every
+- **Squatting resistance** — a maximum of 5 live registrations per
+  forward-confirmed host allocation, regardless of how many Ed25519 owner
+  keys it rotates through. Owner keys authenticate updates; they do not
+  create capacity. That hostname isn't just asserted: every
   registration is checked with a real, forward-confirmed reverse DNS
   (FCrDNS) lookup against the request's actual source IP — the claimed
   hostname's PTR record must name it, and its A/AAAA record must resolve

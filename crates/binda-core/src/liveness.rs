@@ -16,8 +16,8 @@ use crate::client::ClientIdentity;
 /// some real slack before losing its name.
 pub const LIVENESS_WINDOW: Duration = Duration::from_secs(60);
 
-/// The maximum number of live domain registrations a single client
-/// identity may hold at once, enforced while it remains within
+/// The maximum number of live domain registrations a single verified host
+/// allocation may hold at once, enforced while it remains within
 /// [`LIVENESS_WINDOW`].
 pub const MAX_REGISTRATIONS_PER_CLIENT: usize = 5;
 
@@ -76,8 +76,9 @@ impl TimeSource for MockTimeSource {
     }
 }
 
-/// Tracks the last-seen timestamp of every client currently holding
-/// registrations, and how many domains each one holds.
+/// Tracks the last-seen timestamp and domain count for each verified-host
+/// quota subject. A new owner key on the same host deliberately shares the
+/// same entry rather than minting fresh capacity.
 #[derive(Debug, Default)]
 pub struct LivenessTracker {
     last_seen_millis: HashMap<String, u64>,
@@ -92,13 +93,13 @@ impl LivenessTracker {
     /// Record a liveness probe response from `client` at the current time.
     pub fn record_probe(&mut self, client: &ClientIdentity, time: &dyn TimeSource) {
         self.last_seen_millis
-            .insert(client.key(), time.now_millis());
+            .insert(client.quota_key(), time.now_millis());
     }
 
     /// Whether `client` has probed within [`LIVENESS_WINDOW`] of `time`'s
     /// current reading. A client never probed is not considered live.
     pub fn is_live(&self, client: &ClientIdentity, time: &dyn TimeSource) -> bool {
-        match self.last_seen_millis.get(&client.key()) {
+        match self.last_seen_millis.get(&client.quota_key()) {
             Some(&last) => {
                 let now = time.now_millis();
                 now.saturating_sub(last) <= LIVENESS_WINDOW.as_millis() as u64
@@ -110,7 +111,7 @@ impl LivenessTracker {
     /// Current number of registrations attributed to `client`.
     pub fn registration_count(&self, client: &ClientIdentity) -> usize {
         self.registration_counts
-            .get(&client.key())
+            .get(&client.quota_key())
             .copied()
             .unwrap_or(0)
     }
@@ -124,13 +125,16 @@ impl LivenessTracker {
     /// Attribute one more registration to `client`. Callers must have
     /// already checked [`Self::can_register`].
     pub fn increment_registration(&mut self, client: &ClientIdentity) {
-        *self.registration_counts.entry(client.key()).or_insert(0) += 1;
+        *self
+            .registration_counts
+            .entry(client.quota_key())
+            .or_insert(0) += 1;
     }
 
     /// Release all of `client`'s registration slots, e.g. after it drops
     /// out of the live set and its domains are reclaimed.
     pub fn clear_registrations(&mut self, client: &ClientIdentity) {
-        self.registration_counts.remove(&client.key());
+        self.registration_counts.remove(&client.quota_key());
     }
 
     /// Fully forget a client identified by its raw key (as returned by
@@ -236,7 +240,7 @@ mod tests {
         tracker.record_probe(&c, &time);
         tracker.increment_registration(&c);
 
-        tracker.forget_client_by_key(&c.key());
+        tracker.forget_client_by_key(&c.quota_key());
 
         assert_eq!(tracker.registration_count(&c), 0);
         assert!(!tracker.is_live(&c, &time));
@@ -247,7 +251,8 @@ mod tests {
         let time = MockTimeSource::new(0);
         let mut tracker = LivenessTracker::new();
         let stale = client();
-        let fresh = client();
+        let fresh_key = SigningKey::generate(&mut OsRng);
+        let fresh = ClientIdentity::new(fresh_key.verifying_key(), "fresh.example.net");
         tracker.record_probe(&stale, &time);
         time.advance(Duration::from_millis(
             LIVENESS_WINDOW.as_millis() as u64 + 1,
@@ -255,7 +260,7 @@ mod tests {
         tracker.record_probe(&fresh, &time);
 
         let expired = tracker.expired_clients(&time);
-        assert_eq!(expired, vec![stale.key()]);
+        assert_eq!(expired, vec![stale.quota_key()]);
     }
 
     #[test]
