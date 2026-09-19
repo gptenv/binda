@@ -1,5 +1,11 @@
 # binda (bind10)
 
+> BINDA is an independent FOSS DNS resolver project. The name is derived
+> from hexadecimal notation for "bind10" and is unrelated to any
+> commercial brands. It is not affiliated with, endorsed by, or derived
+> from the BIND/BIND9 project or ISC (Internet Systems Consortium) —
+> BINDA's codebase is entirely independent and unique from that project.
+
 BINDA is a Rust-native DNS resolver and naming system designed to make
 traditional domain registrars unnecessary: anyone can register a free
 domain name and keep it for as long as they answer a liveliness probe
