@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 
 use node::Node;
 
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
     gossip_addr: SocketAddr,
     resolver_addr: SocketAddr,
@@ -32,13 +33,20 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// The actual argument-parsing logic, taking an arbitrary iterator of
+/// argument strings instead of reading `std::env::args()` directly, so it
+/// can be exercised by tests without spawning a real process.
+fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut gossip_addr: SocketAddr = "0.0.0.0:9530".parse().unwrap();
     let mut resolver_addr: SocketAddr = "0.0.0.0:9531".parse().unwrap();
     let mut api_addr: SocketAddr = "0.0.0.0:9532".parse().unwrap();
     let mut dns_addr: Option<SocketAddr> = None;
     let mut peers = Vec::new();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--gossip" => {
@@ -141,4 +149,73 @@ async fn main() -> std::io::Result<()> {
         let _ = tokio::join!(gossip_task, resolver_task, api_task);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Args {
+        parse_args_from(strs.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_when_no_flags_given() {
+        let parsed = args(&[]);
+        assert_eq!(parsed.gossip_addr, "0.0.0.0:9530".parse().unwrap());
+        assert_eq!(parsed.resolver_addr, "0.0.0.0:9531".parse().unwrap());
+        assert_eq!(parsed.api_addr, "0.0.0.0:9532".parse().unwrap());
+        assert_eq!(parsed.dns_addr, None);
+        assert!(parsed.peers.is_empty());
+    }
+
+    #[test]
+    fn parses_each_address_flag() {
+        let parsed = args(&[
+            "--gossip",
+            "127.0.0.1:1",
+            "--resolver",
+            "127.0.0.1:2",
+            "--api",
+            "127.0.0.1:3",
+            "--dns",
+            "127.0.0.1:4",
+        ]);
+        assert_eq!(parsed.gossip_addr, "127.0.0.1:1".parse().unwrap());
+        assert_eq!(parsed.resolver_addr, "127.0.0.1:2".parse().unwrap());
+        assert_eq!(parsed.api_addr, "127.0.0.1:3".parse().unwrap());
+        assert_eq!(parsed.dns_addr, Some("127.0.0.1:4".parse().unwrap()));
+    }
+
+    #[test]
+    fn collects_repeated_peer_flags_in_order() {
+        let parsed = args(&["--peer", "127.0.0.1:1", "--peer", "127.0.0.1:2"]);
+        assert_eq!(
+            parsed.peers,
+            vec![
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrecognized_flag_is_ignored_not_fatal() {
+        // Should not panic, and every recognized flag around it should
+        // still be parsed normally.
+        let parsed = args(&["--bogus", "--gossip", "127.0.0.1:1"]);
+        assert_eq!(parsed.gossip_addr, "127.0.0.1:1".parse().unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "--gossip requires an address")]
+    fn missing_value_for_flag_panics_with_clear_message() {
+        args(&["--gossip"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid --gossip address")]
+    fn unparseable_address_panics_with_clear_message() {
+        args(&["--gossip", "not-an-address"]);
+    }
 }
