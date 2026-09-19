@@ -3,11 +3,12 @@
 //! their current registration, keyed with a timestamp + random-nonce
 //! token to make collisions detectable and resolvable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::client::ClientIdentity;
 use crate::collision::negotiate_locally;
 use crate::domain::DomainName;
+use crate::gossip::RegistrationRumor;
 use crate::liveness::{LivenessTracker, TimeSource};
 use crate::token::RegistrationToken;
 use crate::zone::Record;
@@ -16,8 +17,11 @@ use crate::zone::Record;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub client_key: String,
+    /// Canonical FCrDNS host that consumed this registration slot.
+    pub quota_key: String,
     pub token: RegistrationToken,
     pub records: Vec<Record>,
+    pub rumor: Option<RegistrationRumor>,
 }
 
 /// Reasons a registration attempt can be refused.
@@ -25,7 +29,7 @@ pub struct Registration {
 pub enum RegistrationError {
     #[error("client is not currently live (must probe within the liveness window first)")]
     NotLive,
-    #[error("client already holds the maximum number of registrations")]
+    #[error("verified host already holds the maximum number of registrations")]
     RegistrationLimitReached,
 }
 
@@ -38,7 +42,12 @@ pub enum RegistrationError {
 #[derive(Debug, Default)]
 pub struct RegistryStore {
     registrations: HashMap<DomainName, Registration>,
+    /// The currently accepted authenticated claims for a quota subject.
+    /// Over-capacity claims are deliberately discarded at reconciliation:
+    /// they are rejected, not placed in a deferred-registration queue.
+    quota_claims: HashMap<String, HashMap<DomainName, RegistrationRumor>>,
     liveness: LivenessTracker,
+    probe_evidence: HashMap<String, (u64, Vec<u8>)>,
 }
 
 impl RegistryStore {
@@ -49,6 +58,22 @@ impl RegistryStore {
     /// Record a liveness probe from `client`.
     pub fn probe(&mut self, client: &ClientIdentity, time: &dyn TimeSource) {
         self.liveness.record_probe(client, time);
+    }
+
+    pub fn probe_with_evidence(
+        &mut self,
+        client: &ClientIdentity,
+        time: &dyn TimeSource,
+        timestamp: u64,
+        signature: Vec<u8>,
+    ) {
+        self.probe(client, time);
+        self.probe_evidence
+            .insert(client.key(), (timestamp, signature));
+    }
+
+    pub fn last_probe_evidence(&self, client: &ClientIdentity) -> Option<(u64, Vec<u8>)> {
+        self.probe_evidence.get(&client.key()).cloned()
     }
 
     /// Attempt to register `domain` on behalf of `client`.
@@ -88,8 +113,10 @@ impl RegistryStore {
             domain,
             Registration {
                 client_key: client.key(),
+                quota_key: client.quota_key(),
                 token,
                 records: Vec::new(),
+                rumor: None,
             },
         );
         self.liveness.increment_registration(client);
@@ -103,17 +130,19 @@ impl RegistryStore {
     pub fn resolve_collision(
         &mut self,
         domain: DomainName,
-        a: (String, RegistrationToken),
-        b: (String, RegistrationToken),
+        a: (String, String, RegistrationToken),
+        b: (String, String, RegistrationToken),
     ) {
-        let winner_token = negotiate_locally(a.1, b.1);
-        let (client_key, token) = if winner_token == a.1 { a } else { b };
+        let winner_token = negotiate_locally(a.2, b.2);
+        let (client_key, quota_key, token) = if winner_token == a.2 { a } else { b };
         self.registrations.insert(
             domain,
             Registration {
                 client_key,
+                quota_key,
                 token,
                 records: Vec::new(),
+                rumor: None,
             },
         );
     }
@@ -135,40 +164,92 @@ impl RegistryStore {
         }
     }
 
+    /// Persist the owner-signed lease created by the API layer. Only an
+    /// exact locally-issued claim may gain gossip authority.
+    pub fn attach_rumor(&mut self, rumor: RegistrationRumor, time: &dyn TimeSource) -> bool {
+        let quota_key = quota_key(&rumor.rdns);
+        match self.registrations.get(&rumor.domain) {
+            Some(reg) if reg.client_key == rumor.client_key && reg.token == rumor.token => {
+                self.quota_claims
+                    .entry(quota_key.clone())
+                    .or_default()
+                    .insert(rumor.domain.clone(), rumor);
+                self.reconcile_quota(&quota_key, time);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Refresh every locally held lease for an owner after its authenticated
+    /// probe. This makes expiry globally reproducible on the next gossip.
+    pub fn refresh_probe_evidence(&mut self, client_key: &str, timestamp: u64, signature: Vec<u8>) {
+        for registration in self.registrations.values_mut() {
+            if registration.client_key == client_key {
+                if let Some(rumor) = &mut registration.rumor {
+                    rumor.probe_timestamp_millis = timestamp;
+                    rumor.probe_signature = signature.clone();
+                }
+            }
+        }
+        for claims in self.quota_claims.values_mut() {
+            for rumor in claims.values_mut() {
+                if rumor.client_key == client_key {
+                    rumor.probe_timestamp_millis = timestamp;
+                    rumor.probe_signature = signature.clone();
+                }
+            }
+        }
+    }
+
+    pub fn attach_record_evidence(
+        &mut self,
+        domain: &DomainName,
+        client_key: &str,
+        timestamp: u64,
+        signature: Vec<u8>,
+    ) {
+        if let Some(registration) = self.registrations.get_mut(domain) {
+            if registration.client_key == client_key {
+                if let Some(rumor) = &mut registration.rumor {
+                    rumor.records = registration.records.clone();
+                    rumor.records_timestamp_millis = Some(timestamp);
+                    rumor.records_signature = Some(signature.clone());
+                }
+            }
+        }
+        for claims in self.quota_claims.values_mut() {
+            if let Some(rumor) = claims.get_mut(domain) {
+                if rumor.client_key == client_key {
+                    rumor.records_timestamp_millis = Some(timestamp);
+                    rumor.records_signature = Some(signature.clone());
+                }
+            }
+        }
+    }
+
     /// Absorb a fact learned from gossip: another node claims `domain` is
     /// held by `client_key` as of `token`. Never subject to this node's
     /// own liveness/cap rules — those only gate registrations *this* node
     /// issues locally. If the domain is already held here under a
     /// different claim, the two claims are arbitrated via the same mutual
     /// coin-negotiation protocol used for a live collision.
-    pub fn adopt_rumor(
-        &mut self,
-        domain: DomainName,
-        client_key: String,
-        token: RegistrationToken,
-    ) {
-        match self.registrations.get(&domain) {
-            None => {
-                self.registrations.insert(
-                    domain,
-                    Registration {
-                        client_key,
-                        token,
-                        records: Vec::new(),
-                    },
-                );
-            }
-            Some(existing) if existing.client_key == client_key && existing.token == token => {
-                // Already known; nothing to do.
-            }
-            Some(existing) => {
-                self.resolve_collision(
-                    domain,
-                    (existing.client_key.clone(), existing.token),
-                    (client_key, token),
-                );
-            }
+    pub fn adopt_rumor(&mut self, rumor: RegistrationRumor, time: &dyn TimeSource) -> bool {
+        if !rumor.is_authorized()
+            || time
+                .now_millis()
+                .saturating_sub(rumor.probe_timestamp_millis)
+                > crate::liveness::LIVENESS_WINDOW.as_millis() as u64
+        {
+            return false;
         }
+        let quota_key = quota_key(&rumor.rdns);
+        self.quota_claims
+            .entry(quota_key.clone())
+            .or_default()
+            .insert(rumor.domain.clone(), rumor);
+        self.reconcile_quota(&quota_key, time);
+        true
     }
 
     /// Every `(domain, client_key, token)` this node currently holds, for
@@ -189,14 +270,15 @@ impl RegistryStore {
     /// justify that count.
     pub fn reclaim_stale(&mut self, time: &dyn TimeSource) {
         let expired = self.liveness.expired_clients(time);
-        if expired.is_empty() {
-            return;
-        }
         let expired: std::collections::HashSet<String> = expired.into_iter().collect();
         self.registrations
-            .retain(|_, reg| !expired.contains(&reg.client_key));
+            .retain(|_, reg| !expired.contains(&reg.quota_key));
         for key in &expired {
             self.liveness.forget_client_by_key(key);
+        }
+        let quota_keys: Vec<String> = self.quota_claims.keys().cloned().collect();
+        for quota_key in quota_keys {
+            self.reconcile_quota(&quota_key, time);
         }
     }
 
@@ -204,18 +286,96 @@ impl RegistryStore {
     pub fn lookup(&self, domain: &DomainName) -> Option<&Registration> {
         self.registrations.get(domain)
     }
+
+    fn reconcile_quota(&mut self, quota: &str, time: &dyn TimeSource) {
+        let Some(claims) = self.quota_claims.get_mut(quota) else {
+            return;
+        };
+        claims.retain(|_, rumor| rumor.is_authorized() && lease_is_live(rumor, time));
+        let mut winners: Vec<_> = claims.values().cloned().collect();
+        winners.sort_by(|a, b| {
+            a.token
+                .raw_ordering_key()
+                .cmp(&b.token.raw_ordering_key())
+                .then_with(|| a.domain.cmp(&b.domain))
+        });
+        winners.truncate(crate::liveness::MAX_REGISTRATIONS_PER_CLIENT);
+        let winner_domains: HashSet<_> = winners.iter().map(|rumor| rumor.domain.clone()).collect();
+        claims.retain(|domain, _| winner_domains.contains(domain));
+        self.registrations
+            .retain(|_, reg| reg.quota_key != quota || reg.rumor.is_none());
+        for rumor in winners {
+            let replace = match self.registrations.get(&rumor.domain) {
+                Some(existing) => negotiate_locally(existing.token, rumor.token) == rumor.token,
+                None => true,
+            };
+            if replace {
+                self.registrations
+                    .insert(rumor.domain.clone(), registration_from_rumor(rumor, quota));
+            }
+        }
+    }
+}
+
+fn quota_key(rdns: &str) -> String {
+    rdns.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn lease_is_live(rumor: &RegistrationRumor, time: &dyn TimeSource) -> bool {
+    time.now_millis()
+        .saturating_sub(rumor.probe_timestamp_millis)
+        <= crate::liveness::LIVENESS_WINDOW.as_millis() as u64
+}
+
+fn registration_from_rumor(rumor: RegistrationRumor, quota_key: &str) -> Registration {
+    Registration {
+        client_key: rumor.client_key.clone(),
+        quota_key: quota_key.to_string(),
+        token: rumor.token,
+        records: rumor.records.clone(),
+        rumor: Some(rumor),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::liveness::MockTimeSource;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     fn client() -> ClientIdentity {
         let signing_key = SigningKey::generate(&mut OsRng);
         ClientIdentity::new(signing_key.verifying_key(), "host.example.net")
+    }
+
+    fn signed_rumor(domain: DomainName, timestamp: u64) -> RegistrationRumor {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let rdns = "shared.example.net".to_string();
+        let owner = ClientIdentity::new(signing_key.verifying_key(), rdns.clone());
+        RegistrationRumor {
+            domain: domain.clone(),
+            token: RegistrationToken {
+                issued_at_millis: timestamp,
+                nonce: [timestamp as u8; 8],
+            },
+            client_key: owner.key(),
+            owner_key: signing_key.verifying_key().to_bytes().to_vec(),
+            rdns,
+            registration_timestamp_millis: timestamp,
+            registration_signature: signing_key
+                .sign(&crate::client_api::register_message(&domain, timestamp))
+                .to_bytes()
+                .to_vec(),
+            probe_timestamp_millis: timestamp,
+            probe_signature: signing_key
+                .sign(&crate::client_api::probe_message(timestamp))
+                .to_bytes()
+                .to_vec(),
+            records: Vec::new(),
+            records_timestamp_millis: None,
+            records_signature: None,
+        }
     }
 
     #[test]
@@ -226,6 +386,79 @@ mod tests {
         store.probe(&c, &time);
         let domain = DomainName::new("example.binda").unwrap();
         assert!(store.register(domain, &c, &time).is_ok());
+    }
+
+    #[test]
+    fn rotating_owner_keys_does_not_reset_a_verified_hosts_quota() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        let first = client();
+        let replacement = client();
+        assert_eq!(first.quota_key(), replacement.quota_key());
+        assert_ne!(first.key(), replacement.key());
+        store.probe(&first, &time);
+        for i in 0..crate::liveness::MAX_REGISTRATIONS_PER_CLIENT {
+            store
+                .register(
+                    DomainName::new(format!("first-{i}.binda")).unwrap(),
+                    &first,
+                    &time,
+                )
+                .unwrap();
+        }
+        // A probe signed by a replacement key keeps the same reachable
+        // host live, but must not manufacture another five slots.
+        store.probe(&replacement, &time);
+        assert_eq!(
+            store.register(DomainName::new("sixth.binda").unwrap(), &replacement, &time),
+            Err(RegistrationError::RegistrationLimitReached)
+        );
+    }
+
+    #[test]
+    fn gossip_claims_converge_to_the_first_five_for_one_verified_host() {
+        let time = MockTimeSource::new(1_000);
+        let mut store = RegistryStore::new();
+        for i in 0..6 {
+            let domain = DomainName::new(format!("claim-{i}.binda")).unwrap();
+            assert!(store.adopt_rumor(signed_rumor(domain, i), &time));
+        }
+        for i in 0..5 {
+            assert!(store
+                .lookup(&DomainName::new(format!("claim-{i}.binda")).unwrap())
+                .is_some());
+        }
+        assert!(store
+            .lookup(&DomainName::new("claim-5.binda").unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn over_capacity_claim_is_not_promoted_after_winners_expire() {
+        let time = MockTimeSource::new(0);
+        let mut store = RegistryStore::new();
+        for i in 0..5 {
+            assert!(store.adopt_rumor(
+                signed_rumor(DomainName::new(format!("old-{i}.binda")).unwrap(), 0),
+                &time
+            ));
+        }
+        let replacement = DomainName::new("replacement.binda").unwrap();
+        assert!(store.adopt_rumor(signed_rumor(replacement.clone(), 1), &time));
+        assert!(store.lookup(&replacement).is_none());
+        assert!(!store
+            .quota_claims
+            .get("shared.example.net")
+            .unwrap()
+            .contains_key(&replacement));
+        time.advance(std::time::Duration::from_millis(
+            crate::liveness::LIVENESS_WINDOW.as_millis() as u64 + 2,
+        ));
+        store.reclaim_stale(&time);
+        assert!(store.lookup(&replacement).is_none());
+        assert!(store
+            .lookup(&DomainName::new("old-0.binda").unwrap())
+            .is_none());
     }
 
     #[test]
@@ -281,42 +514,6 @@ mod tests {
         store.probe(&c, &time);
         let domain = DomainName::new("fresh.binda").unwrap();
         assert!(store.register(domain, &c, &time).is_ok());
-    }
-
-    #[test]
-    fn adopt_rumor_inserts_when_domain_unknown() {
-        let mut store = RegistryStore::new();
-        let domain = DomainName::new("example.binda").unwrap();
-        let token = RegistrationToken::issue(1000);
-        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
-        let reg = store.lookup(&domain).unwrap();
-        assert_eq!(reg.client_key, "someone");
-        assert_eq!(reg.token, token);
-    }
-
-    #[test]
-    fn adopt_rumor_is_a_no_op_when_already_known() {
-        let mut store = RegistryStore::new();
-        let domain = DomainName::new("example.binda").unwrap();
-        let token = RegistrationToken::issue(1000);
-        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
-        // Same client_key and token again: nothing should change.
-        store.adopt_rumor(domain.clone(), "someone".to_string(), token);
-        let reg = store.lookup(&domain).unwrap();
-        assert_eq!(reg.client_key, "someone");
-        assert_eq!(reg.token, token);
-    }
-
-    #[test]
-    fn adopt_rumor_resolves_collision_when_claims_differ() {
-        let mut store = RegistryStore::new();
-        let domain = DomainName::new("example.binda").unwrap();
-        let token_a = RegistrationToken::issue(1000);
-        let token_b = RegistrationToken::issue(2000);
-        store.adopt_rumor(domain.clone(), "a".to_string(), token_a);
-        store.adopt_rumor(domain.clone(), "b".to_string(), token_b);
-        let reg = store.lookup(&domain).unwrap();
-        assert!(reg.client_key == "a" || reg.client_key == "b");
     }
 
     #[test]

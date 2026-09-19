@@ -277,11 +277,14 @@ impl Node {
                     domains
                         .into_iter()
                         .filter_map(|domain| {
-                            store.lookup(&domain).map(|reg| RegistrationRumor {
-                                domain,
-                                token: reg.token,
-                                client_key: reg.client_key.clone(),
-                            })
+                            store
+                                .lookup(&domain)
+                                .and_then(|reg| reg.rumor.as_ref())
+                                .map(|rumor| {
+                                    let mut rumor = rumor.clone();
+                                    rumor.domain = domain;
+                                    rumor
+                                })
                         })
                         .collect()
                 };
@@ -331,7 +334,7 @@ impl Node {
 
                 let mut store = self.store.lock().await;
                 for rumor in rumors {
-                    store.adopt_rumor(rumor.domain, rumor.client_key, rumor.token);
+                    store.adopt_rumor(rumor, self.time.as_ref());
                 }
             }
         }
@@ -471,7 +474,7 @@ mod tests {
     use binda_core::domain::DomainName;
     use binda_core::liveness::SystemTimeSource;
     use binda_core::token::RegistrationToken;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use std::time::Duration as StdDuration;
 
@@ -585,9 +588,39 @@ mod tests {
         store
             .register(domain.clone(), &client, node.time.as_ref())
             .unwrap();
+        let token = store.lookup(domain).unwrap().token;
+        let timestamp = node.time.now_millis();
+        let probe_signature = signing_key.sign(&binda_core::client_api::probe_message(timestamp));
+        let registration_signature =
+            signing_key.sign(&binda_core::client_api::register_message(domain, timestamp));
         if !records.is_empty() {
-            assert!(store.set_records(domain, &client, records));
+            assert!(store.set_records(domain, &client, records.clone()));
         }
+        let records_signature = (!records.is_empty()).then(|| {
+            signing_key
+                .sign(&binda_core::client_api::set_records_message(
+                    domain, &records, timestamp,
+                ))
+                .to_bytes()
+                .to_vec()
+        });
+        assert!(store.attach_rumor(
+            RegistrationRumor {
+                domain: domain.clone(),
+                token,
+                client_key: client.key(),
+                owner_key: signing_key.verifying_key().to_bytes().to_vec(),
+                rdns: client.rdns.clone(),
+                registration_timestamp_millis: timestamp,
+                registration_signature: registration_signature.to_bytes().to_vec(),
+                probe_timestamp_millis: timestamp,
+                probe_signature: probe_signature.to_bytes().to_vec(),
+                records: records.clone(),
+                records_timestamp_millis: records_signature.as_ref().map(|_| timestamp),
+                records_signature,
+            },
+            node.time.as_ref()
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -675,6 +708,15 @@ mod tests {
                 domain: evil_domain.clone(),
                 token: binda_core::token::RegistrationToken::issue(0),
                 client_key: "rogue".to_string(),
+                owner_key: vec![],
+                rdns: String::new(),
+                registration_timestamp_millis: 0,
+                registration_signature: vec![],
+                probe_timestamp_millis: 0,
+                probe_signature: vec![],
+                records: vec![],
+                records_timestamp_millis: None,
+                records_signature: None,
             }],
             challenge_answer: wrong,
         };
@@ -725,6 +767,15 @@ mod tests {
                 domain: domain.clone(),
                 token,
                 client_key: "honest".to_string(),
+                owner_key: vec![],
+                rdns: String::new(),
+                registration_timestamp_millis: 0,
+                registration_signature: vec![],
+                probe_timestamp_millis: 0,
+                probe_signature: vec![],
+                records: vec![],
+                records_timestamp_millis: None,
+                records_signature: None,
             }],
             challenge_answer: challenge.expected_answer(),
         };
@@ -736,11 +787,11 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(500)).await;
 
         let store = victim.store.lock().await;
-        let reg = store
-            .lookup(&domain)
-            .expect("a correctly-answered rumor should be adopted");
-        assert_eq!(reg.client_key, "honest");
-        assert_eq!(reg.token, token);
+        let reg = store.lookup(&domain);
+        assert!(
+            reg.is_none(),
+            "a conformance response without an owner-signed lease must not be adopted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -774,6 +825,15 @@ mod tests {
                 domain: unrequested.clone(),
                 token: binda_core::token::RegistrationToken::issue(0),
                 client_key: "rogue".into(),
+                owner_key: vec![],
+                rdns: String::new(),
+                registration_timestamp_millis: 0,
+                registration_signature: vec![],
+                probe_timestamp_millis: 0,
+                probe_signature: vec![],
+                records: vec![],
+                records_timestamp_millis: None,
+                records_signature: None,
             }],
             challenge_answer: challenge.expected_answer(),
         };

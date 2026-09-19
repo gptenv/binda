@@ -45,6 +45,17 @@ impl ClientIdentity {
         )
     }
 
+    /// The scarce, verified-host subject that gates registration capacity.
+    ///
+    /// Owner keys are intentionally cheap to rotate.  They authenticate
+    /// updates, but must never create fresh domain capacity.  The daemon
+    /// forward-confirms this hostname against the request's observed source
+    /// address before allowing a registration; canonicalising it here makes
+    /// case and a trailing DNS dot unable to split one host's quota.
+    pub fn quota_key(&self) -> String {
+        self.rdns.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
     /// Verify that `signature` over `message` was produced by this client's
     /// private key.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), ClientAuthError> {
@@ -82,5 +93,17 @@ mod tests {
             identity.verify(b"register: evil.binda", &sig),
             Err(ClientAuthError::InvalidSignature)
         );
+    }
+
+    #[test]
+    fn quota_key_is_host_scoped_and_canonical() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let a = ClientIdentity::new(signing_key.verifying_key(), "Host.Example.Net.");
+        let b = ClientIdentity::new(
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            "host.example.net",
+        );
+        assert_eq!(a.quota_key(), b.quota_key());
+        assert_ne!(a.key(), b.key());
     }
 }

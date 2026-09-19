@@ -5,6 +5,7 @@ use crate::client_api::{
     authenticate, probe_message, register_message, set_records_message, ClientRequest,
     ClientResponse, ProbeBody, RegisterBody, SetRecordsBody, SignedEnvelope,
 };
+use crate::gossip::RegistrationRumor;
 use crate::liveness::TimeSource;
 use crate::store::RegistryStore;
 
@@ -41,7 +42,17 @@ fn handle_probe(
     let message = probe_message(envelope.timestamp_millis);
     match authenticate(&envelope, &message, now) {
         Ok(identity) => {
-            store.probe(&identity, time);
+            store.probe_with_evidence(
+                &identity,
+                time,
+                envelope.timestamp_millis,
+                envelope.signature.clone(),
+            );
+            store.refresh_probe_evidence(
+                &identity.key(),
+                envelope.timestamp_millis,
+                envelope.signature,
+            );
             ClientResponse::ProbeAck
         }
         Err(err) => ClientResponse::Error {
@@ -65,8 +76,28 @@ fn handle_register(
                     message: "claimed rdns hostname does not forward-confirm against the request's source address".to_string(),
                 };
             }
-            match store.register(envelope.body.domain, &identity, time) {
-                Ok(token) => ClientResponse::Registered { token },
+            match store.register(envelope.body.domain.clone(), &identity, time) {
+                Ok(token) => {
+                    let (probe_timestamp_millis, probe_signature) = store
+                        .last_probe_evidence(&identity)
+                        .expect("live registrations have a signed probe");
+                    let rumor = RegistrationRumor {
+                        domain: envelope.body.domain,
+                        token,
+                        client_key: identity.key(),
+                        owner_key: envelope.verifying_key,
+                        rdns: envelope.rdns,
+                        registration_timestamp_millis: envelope.timestamp_millis,
+                        registration_signature: envelope.signature.clone(),
+                        probe_timestamp_millis,
+                        probe_signature,
+                        records: Vec::new(),
+                        records_timestamp_millis: None,
+                        records_signature: None,
+                    };
+                    let _ = store.attach_rumor(rumor, time);
+                    ClientResponse::Registered { token }
+                }
                 Err(err) => ClientResponse::Error {
                     message: err.to_string(),
                 },
@@ -91,6 +122,12 @@ fn handle_set_records(
     match authenticate(&envelope, &message, now) {
         Ok(identity) => {
             if store.set_records(&envelope.body.domain, &identity, envelope.body.records) {
+                store.attach_record_evidence(
+                    &envelope.body.domain,
+                    &identity.key(),
+                    envelope.timestamp_millis,
+                    envelope.signature,
+                );
                 ClientResponse::RecordsSet
             } else {
                 ClientResponse::Error {

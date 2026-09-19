@@ -20,15 +20,20 @@ within a 1-minute window.
   respond to a liveness probe within a minute; miss the window and it
   falls back into the pool. (Originally a stricter 3 seconds; relaxed to
   give room for ordinary reconfiguration downtime.)
-- **Squatting resistance** — a maximum of 5 live registrations per client,
-  where a client is identified by an Ed25519 signature combined with its
-  reverse-DNS hostname. That hostname isn't just asserted: every
+- **Squatting resistance** — a maximum of 5 live registrations per
+  forward-confirmed host allocation, regardless of how many Ed25519 owner
+  keys it rotates through. Owner keys authenticate updates; they do not
+  create capacity. That hostname isn't just asserted: every
   registration is checked with a real, forward-confirmed reverse DNS
   (FCrDNS) lookup against the request's actual source IP — the claimed
   hostname's PTR record must name it, and its A/AAAA record must resolve
   back to that same IP (see
   [`fcrdns`](crates/binda-core/src/fcrdns.rs)) — so the cap applies to a
   real, distinctly-controlled host rather than to a free-to-mint keypair.
+  When separate instances concurrently learn more than five valid claims
+  for one host, every replica deterministically retains the same first
+  five and rejects the rest. A later vacancy is free for a new claim; it
+  never automatically promotes an earlier rejected registration.
 - **Full Unicode names, no length limit** — domain labels may use any
   printable Unicode scalar value: emoji, combining-mark ("zalgo")
   sequences, and mixed right-to-left/left-to-right scripts (intermixed
