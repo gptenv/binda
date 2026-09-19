@@ -54,6 +54,27 @@ impl RdnsVerifier for FcrdnsVerifier {
     }
 }
 
+/// A verifier that accepts every claimed hostname without checking it
+/// against anything.
+///
+/// **Never use this for a real deployment.** It exists purely so a node
+/// can be run locally (on a laptop with no reverse DNS delegation, behind
+/// NAT, on 127.0.0.1) for demos, examples, and manual testing, where no
+/// claimed `rdns` could ever forward-confirm for real. With this
+/// verifier installed, the "5 domains per live socket" cap once again
+/// means nothing more than "5 domains per free keypair" — exactly the
+/// gap [`FcrdnsVerifier`] exists to close. A node only uses this if it
+/// was explicitly started with a flag that says so out loud (see the
+/// `binda` binary's `--insecure-skip-rdns-verification`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllowAllVerifier;
+
+impl RdnsVerifier for AllowAllVerifier {
+    fn verify(&self, _source_ip: IpAddr, _claimed_rdns: &str) -> bool {
+        true
+    }
+}
+
 /// Full FCrDNS check: `claimed_rdns` must appear in `source_ip`'s PTR
 /// records, and a forward lookup of `claimed_rdns` must resolve back to
 /// `source_ip`.
@@ -356,6 +377,13 @@ mod tests {
         let verifier = FakeVerifier(vec![(ip, "host.example.net".to_string())]);
         assert!(verifier.verify(ip, "host.example.net"));
         assert!(!verifier.verify(ip, "someone-else.example.net"));
+    }
+
+    #[test]
+    fn allow_all_verifier_accepts_any_claim() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(AllowAllVerifier.verify(ip, "literally-anything.invalid"));
+        assert!(AllowAllVerifier.verify(ip, ""));
     }
 
     fn encode_name(name: &str) -> Vec<u8> {
